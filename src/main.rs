@@ -207,11 +207,14 @@ fn config_path(app: &AppHandle) -> PathBuf {
 // ponytail: drop this once nobody updates from 0.1.1 anymore.
 fn migrate_config(app: &AppHandle) {
     let dir = app.path().app_config_dir().expect("config dir");
-    let old = dir.with_file_name("com.television.app");
+    copy_config(&dir.with_file_name("com.television.app"), &dir);
+}
+
+fn copy_config(old: &std::path::Path, dir: &std::path::Path) {
     if dir.exists() || !old.exists() {
         return;
     }
-    let _ = fs::create_dir_all(&dir);
+    let _ = fs::create_dir_all(dir);
     for f in ["settings.json", "window-height"] {
         let _ = fs::copy(old.join(f), dir.join(f));
     }
@@ -294,6 +297,16 @@ fn show_window(app: &AppHandle) {
     });
 }
 
+/// After trying to register the save hotkey: true = it works now. A newly picked hotkey that's
+/// taken rejects the update; the same hotkey still taken lets the rest of the update through.
+fn hotkey_outcome(changed: bool, registered: Result<(), String>) -> Result<bool, String> {
+    match registered {
+        Ok(()) => Ok(true),
+        Err(e) if changed => Err(format!("Can't use that hotkey: {e}")),
+        Err(_) => Ok(false),
+    }
+}
+
 // Async (off the main thread): a buffer restart holds the lock for up to a few seconds, and a
 // sync command waiting on it would freeze the window and tray.
 #[tauri::command]
@@ -319,11 +332,7 @@ async fn update_settings(app: AppHandle, state: State<'_, Mutex<App>>, mut setti
     let mut registered = false;
     if changed || failed {
         let gs = app.global_shortcut();
-        match gs.register(settings.hotkey.as_str()) {
-            Ok(()) => registered = true,
-            Err(e) if changed => return Err(format!("Can't use that hotkey: {e}")),
-            Err(_) => {}
-        }
+        registered = hotkey_outcome(changed, gs.register(settings.hotkey.as_str()).map_err(|e| e.to_string()))?;
         if changed {
             let _ = gs.unregister(old_hotkey.as_str());
         }
@@ -400,6 +409,30 @@ async fn pick_folder(app: AppHandle) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn taken_hotkey_only_rejects_a_new_pick() {
+        let taken = || Err("already registered".to_string());
+        assert_eq!(super::hotkey_outcome(false, taken()), Ok(false)); // unchanged, still taken: rest applies
+        assert!(super::hotkey_outcome(true, taken()).is_err()); // newly picked and taken: rejected
+        assert_eq!(super::hotkey_outcome(true, Ok(())), Ok(true));
+        assert_eq!(super::hotkey_outcome(false, Ok(())), Ok(true)); // retry worked: warning clears
+    }
+
+    #[test]
+    fn old_config_is_copied_once() {
+        let root = std::env::temp_dir().join(format!("television-migrate-{}", std::process::id()));
+        let (old, new) = (root.join("com.television.app"), root.join("com.teleqwe.television"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("settings.json"), "{\"fps\":144}").unwrap();
+        super::copy_config(&old, &new);
+        assert_eq!(std::fs::read_to_string(new.join("settings.json")).unwrap(), "{\"fps\":144}");
+        assert!(!new.join("window-height").exists()); // missing files are skipped
+        std::fs::write(old.join("settings.json"), "{}").unwrap();
+        super::copy_config(&old, &new); // already migrated: left alone
+        assert_eq!(std::fs::read_to_string(new.join("settings.json")).unwrap(), "{\"fps\":144}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn sanitize_keeps_settings_in_range() {
         let mut s = super::Settings { fps: 0, keyint: 1000, clip_seconds: 0, container: r"mp4\..\x".into(), codec: "x".into(), ..Default::default() };
