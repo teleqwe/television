@@ -14,7 +14,7 @@ A lightweight, vibe-coded replay buffer for Windows: a ShadowPlay alternative wi
 
 ## Install
 
-Download the installer from [Releases](../../releases) and run it. It installs for your user only, so no admin is needed. The installer isn't code-signed, so if SmartScreen warns, choose **More info → Run anyway**.
+Download **[Television 0.1.2](https://github.com/teleqwe/television/releases/download/v0.1.2/Television_0.1.2_x64-setup.exe)** (the latest version; older ones are under [Releases](../../releases)) and run it. Updating over an existing install keeps your settings. It installs for your user only, so no admin is needed. The installer isn't code-signed, so if SmartScreen warns, choose **More info → Run anyway**.
 
 **Requires** Windows 10 2004 or later (Windows 11 recommended) and an NVIDIA GPU with NVENC.
 
