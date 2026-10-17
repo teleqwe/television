@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Television",
+  "version": "0.1.1",
+  "identifier": "com.television.app",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "third_party/ffmpeg/bin/avcodec-62.dll": "./",
+      "third_party/ffmpeg/bin/avformat-62.dll": "./",
+      "third_party/ffmpeg/bin/avutil-60.dll": "./",
+      "third_party/ffmpeg/bin/swresample-6.dll": "./",
+      "third_party/ffmpeg/LICENSE.txt": "FFmpeg-LICENSE.txt"
+    },
+    "windows": {
+      "nsis": { "installerHooks": "installer.nsh" }
+    }
+  }
+}

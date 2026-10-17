@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Television</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32"><defs><linearGradient id="g" x2="1" y2="1"><stop offset="0" stop-color="#5c8cff"/><stop offset="1" stop-color="#7c5cff"/></linearGradient></defs><path d="M10.5 3 16 8.5 21.5 3" fill="none" stroke="#6f7cff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><rect x="2" y="8.5" width="28" height="21" rx="5" fill="url(#g)"/><rect x="5" y="11.5" width="22" height="15" rx="2.5" fill="#0e0f11"/><path d="M13.5 15v7l6-3.5z" fill="#fff"/></svg>
+    <div>
+      <h1>Television</h1>
+      <div class="status"><span id="dot" class="dot"></span><span id="status">Starting…</span></div>
+    </div>
+  </div>
+  <button id="save" class="primary">Save clip <kbd id="save-key"></kbd></button>
+</header>
+
+<div id="error" class="banner" hidden></div>
+
+<main>
+  <section>
+    <h2>Capture</h2>
+    <div class="card">
+      <div class="row" data-tip="What gets recorded. Automatic records the focused fullscreen game (only the game, so notifications and other windows stay out) and your main display the rest of the time. Pick a display to record everything on it, or a window to record just that window. Exclusive-fullscreen games on a portrait (rotated) monitor aren't supported: they record sideways.">
+        <label for="source">Source</label>
+        <div class="ctl with-btn">
+          <select id="source" data-k="source"></select>
+          <button id="refresh" class="icon" title="Refresh list"><svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg></button>
+        </div>
+      </div>
+      <div class="row" data-tip="Records at a lower resolution than your screen. Smaller files and less memory, at the cost of sharpness. Scaling runs on the GPU's video engine, not the cores your game uses.">
+        <label for="output_height">Output resolution</label>
+        <div class="ctl"><select id="output_height" data-k="output_height" data-num>
+          <option value="0">Same as source</option><option value="2160">2160p</option><option value="1440">1440p</option>
+          <option value="1080">1080p</option><option value="900">900p</option><option value="720">720p</option>
+        </select></div>
+      </div>
+      <div class="row" data-tip="Frames recorded per second. 60 looks smooth for most games. Higher frame rates need more bitrate to keep the same quality.">
+        <label for="fps">Frame rate</label>
+        <div class="ctl"><select id="fps" data-k="fps" data-num>
+          <option value="30">30 fps</option><option value="48">48 fps</option><option value="60">60 fps</option>
+          <option value="90">90 fps</option><option value="120">120 fps</option><option value="144">144 fps</option>
+          <option value="165">165 fps</option><option value="240">240 fps</option>
+        </select></div>
+      </div>
+      <div class="row" data-tip="Shows what's being recorded, updated twice a second, so you can check the source isn't black or the wrong screen. Only runs while this window is open and the switch is on.">
+        <label for="preview">Preview</label>
+        <div class="ctl end"><input type="checkbox" class="switch" id="preview"></div>
+      </div>
+      <canvas id="preview-img" class="preview" hidden></canvas>
+      <div class="row" data-tip="Draws the mouse cursor in recordings.">
+        <label for="cursor">Show cursor</label>
+        <div class="ctl end"><input type="checkbox" class="switch" id="cursor" data-k="cursor"></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Video</h2>
+    <div class="card">
+      <div class="row" data-tip="H.264 plays everywhere: Discord, browsers, phones, every editor. HEVC (H.265) looks about 30–40% better at the same bitrate, but some players and sites can't play it.">
+        <label for="codec">Encoder</label>
+        <div class="ctl"><select id="codec" data-k="codec">
+          <option value="h264_nvenc">H.264 · NVENC</option><option value="hevc_nvenc">HEVC · NVENC</option>
+        </select></div>
+      </div>
+      <div class="row" data-tip="CBR spends the same bitrate every second, so file size and memory are predictable. Recommended for replay buffers. VBR spends less on simple scenes and more on busy ones, up to Max bitrate. CQP holds a fixed quality and lets the size vary wildly.">
+        <label for="rate_control">Rate control</label>
+        <div class="ctl"><select id="rate_control" data-k="rate_control">
+          <option value="cbr">CBR · constant bitrate</option><option value="vbr">VBR · variable bitrate</option><option value="cqp">CQP · constant quality</option>
+        </select></div>
+      </div>
+      <div class="row" data-show="rate_control=cbr,vbr" data-tip="Video data per second. Higher looks better but makes bigger files and uses more memory. Good ranges: 1080p60 12–20k, 1440p60 20–35k, 4K60 40–60k kbps.">
+        <label for="bitrate">Bitrate</label>
+        <div class="ctl unit" data-unit="kbps"><input type="number" id="bitrate" data-k="bitrate" min="1000" max="200000" step="500"></div>
+      </div>
+      <div class="row" data-show="rate_control=vbr" data-tip="The most VBR may spend in busy moments. About 1.5× the bitrate is typical.">
+        <label for="max_bitrate">Max bitrate</label>
+        <div class="ctl unit" data-unit="kbps"><input type="number" id="max_bitrate" data-k="max_bitrate" min="1000" max="300000" step="500"></div>
+      </div>
+      <div class="row" data-show="rate_control=cqp" data-tip="Fixed quality level from 0 to 51. Lower is better and bigger. 18–23 looks great for most content; 0 is near lossless and huge.">
+        <label for="cq">Quality <small>Lower is better · 18–23 typical</small></label>
+        <div class="ctl unit" data-unit="QP"><input type="number" id="cq" data-k="cq" min="0" max="51"></div>
+      </div>
+      <div class="row" data-tip="Trades encoder speed for quality. Higher presets (P6–P7) look better at the same bitrate and work the NVENC chip harder. NVENC is separate from the cores games use, so P5–P6 is a good balance.">
+        <label for="preset">Preset</label>
+        <div class="ctl"><select id="preset" data-k="preset">
+          <option value="p1">P1 · Fastest</option><option value="p2">P2 · Faster</option><option value="p3">P3 · Fast</option>
+          <option value="p4">P4 · Medium</option><option value="p5">P5 · Slow</option><option value="p6">P6 · Slower</option>
+          <option value="p7">P7 · Slowest</option>
+        </select></div>
+      </div>
+      <details>
+        <summary class="row"><span>Advanced</span><svg class="chev" viewBox="0 0 16 16"><path d="m4 6 4 4 4-4"/></svg></summary>
+        <div class="row" data-tip="High quality is right for recording. The low-latency modes are for live streaming and video calls; they give up some quality to output each frame sooner.">
+          <label for="tune">Tuning</label>
+          <div class="ctl"><select id="tune" data-k="tune">
+            <option value="hq">High quality</option><option value="ll">Low latency</option><option value="ull">Ultra low latency</option>
+          </select></div>
+        </div>
+        <div class="row" data-tip="The encoder looks at each frame twice to spend bits where they matter. Quarter resolution is cheap and helps; full resolution helps a bit more but costs more encoder time.">
+          <label for="multipass">Multipass</label>
+          <div class="ctl"><select id="multipass" data-k="multipass">
+            <option value="disabled">Off</option><option value="qres">Quarter resolution</option><option value="fullres">Full resolution</option>
+          </select></div>
+        </div>
+        <div class="row" data-tip="Seconds between keyframes (complete pictures). Clips must start on one, so a saved clip can run up to this much longer than the clip length. 2 s is standard.">
+          <label for="keyint">Keyframe interval</label>
+          <div class="ctl unit" data-unit="s"><input type="number" id="keyint" data-k="keyint" min="1" max="10"></div>
+        </div>
+        <div class="row" data-tip="Frames predicted from the frames before and after them. They make files slightly smaller at the same quality, but each one adds ~50 MB of encoder memory. At replay-buffer bitrates 0 looks the same.">
+          <label for="bframes">B-frames <small>Each adds ~50 MB of memory</small></label>
+          <div class="ctl"><select id="bframes" data-k="bframes" data-num>
+            <option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option>
+          </select></div>
+        </div>
+        <div class="row" data-tip="The encoder looks ahead at upcoming frames to pick better frame types and bitrate, which helps with sudden scene changes. Runs on CUDA, so it shows up as some GPU usage.">
+          <label for="lookahead">Look-ahead <small>Uses extra GPU</small></label>
+          <div class="ctl end"><input type="checkbox" class="switch" id="lookahead" data-k="lookahead"></div>
+        </div>
+        <div class="row" data-tip="Adaptive quantization: moves bits to the areas your eyes notice most (flat surfaces, dark scenes, motion). Usually looks better at the same bitrate. Runs on CUDA, so it shows up as some GPU usage.">
+          <label for="psycho_visual">Psycho-visual tuning <small>Uses extra GPU</small></label>
+          <div class="ctl end"><input type="checkbox" class="switch" id="psycho_visual" data-k="psycho_visual"></div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <section>
+    <h2>Audio</h2>
+    <div class="card">
+      <div class="row" data-tip="Everything you hear, recorded on its own track. The speaker button mutes it live without changing the track layout.">
+        <label for="desktop">Desktop audio</label>
+        <div class="ctl end gap">
+          <button class="icon mute" data-mute="desktop_muted" title="Mute"></button>
+          <input type="checkbox" class="switch" id="desktop" data-k="desktop">
+        </div>
+      </div>
+      <div class="row sub" data-show="desktop=true">
+        <label for="desktop_device">Device</label>
+        <div class="ctl"><select id="desktop_device" data-k="desktop_device" data-devices="out"></select></div>
+      </div>
+      <div class="row" data-tip="Your microphone, recorded on its own track. The speaker button mutes it live.">
+        <label for="mic">Microphone</label>
+        <div class="ctl end gap">
+          <button class="icon mute" data-mute="mic_muted" title="Mute"></button>
+          <input type="checkbox" class="switch" id="mic" data-k="mic">
+        </div>
+      </div>
+      <div class="row sub" data-show="mic=true">
+        <label for="mic_device">Device</label>
+        <div class="ctl"><select id="mic_device" data-k="mic_device" data-devices="in"></select></div>
+      </div>
+      <div id="apps"></div>
+      <div class="row" data-tip="Records one app's audio on its own track, e.g. Discord or the game alone, so you can adjust or remove it when editing. The list shows apps that are playing or have played sound. Desktop audio already includes every app, so app tracks are extras for editing.">
+        <label for="app-pick">Add app track</label>
+        <div class="ctl with-btn">
+          <select id="app-pick"></select>
+          <button id="refresh-apps" class="icon" title="Refresh list"><svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg></button>
+        </div>
+      </div>
+      <div class="row" data-tip="Quality of every audio track. 160 kbps is transparent for most people; go higher if you edit music.">
+        <label for="audio_bitrate">Audio bitrate</label>
+        <div class="ctl"><select id="audio_bitrate" data-k="audio_bitrate" data-num>
+          <option value="96">96 kbps</option><option value="128">128 kbps</option><option value="160">160 kbps</option>
+          <option value="192">192 kbps</option><option value="256">256 kbps</option><option value="320">320 kbps</option>
+        </select></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Clips</h2>
+    <div class="card">
+      <div class="row" data-tip="How many seconds before you press the hotkey get saved. Memory (or disk) use grows with this and the bitrate.">
+        <label for="clip_seconds">Clip length <small id="mem"></small></label>
+        <div class="ctl unit" data-unit="sec"><input type="number" id="clip_seconds" data-k="clip_seconds" min="5" max="1800" step="5"></div>
+      </div>
+      <div class="row" data-tip="Memory is the default. Disk keeps the buffer in a temp folder so RAM stays low however long the clip, but it writes to your drive constantly (about 9 GB per hour at 20 Mbps).">
+        <label for="buffer_on_disk">Buffer in</label>
+        <div class="ctl"><select id="buffer_on_disk" data-k="buffer_on_disk" data-bool>
+          <option value="false">Memory</option><option value="true">Disk</option>
+        </select></div>
+      </div>
+      <div class="row" data-tip="Saves a clip from anywhere, even in game. Click, then press the key combination; Esc cancels.">
+        <label for="hotkey">Save hotkey</label>
+        <div class="ctl"><button id="hotkey" class="field">—</button></div>
+      </div>
+      <div class="row" data-tip="MP4 plays everywhere and embeds in Discord. OBS defaults to MKV because it survives crashes mid-recording, but Television writes each clip in one go, so that doesn't matter here. Pick MKV only if your editor prefers it.">
+        <label for="container">Format</label>
+        <div class="ctl"><select id="container" data-k="container">
+          <option value="mp4">MP4</option><option value="mkv">MKV</option>
+        </select></div>
+      </div>
+      <div class="row" data-tip="Folder clips are saved to. Click to choose another.">
+        <label for="folder">Save to</label>
+        <div class="ctl with-btn">
+          <button id="folder" class="field path"></button>
+          <button id="open" class="icon" title="Open folder"><svg viewBox="0 0 16 16"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z"/></svg></button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>General</h2>
+    <div class="card">
+      <div class="row" data-tip="Starts Television in the tray when you sign in to Windows, so the buffer is always running.">
+        <label for="autostart">Start with Windows</label>
+        <div class="ctl end"><input type="checkbox" class="switch" id="autostart" data-k="autostart"></div>
+      </div>
+    </div>
+  </section>
+  <p class="note">Changing capture, video or audio-track settings restarts the buffer.</p>
+</main>
+
+<div id="tip" class="tip" hidden></div>
+<div id="toast" class="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+[package]
+name = "television"
+version = "0.1.1"
+edition = "2024"
+description = "A lightweight NVENC replay buffer for Windows"
+license = "MIT"
+repository = "https://github.com/teleqwe/television"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.152"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_WinRT", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Win32_System_Com", "Win32_System_Performance", "Win32_Media_Audio", "Win32_UI_WindowsAndMessaging", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11", "Foundation", "Graphics", "Win32_System_SystemInformation", "Win32_System_Diagnostics_Debug", "Win32_System_Registry", "Win32_System_Diagnostics_ToolHelp", "Win32_Devices_FunctionDiscovery", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Security_Authorization_AppCapabilityAccess", "Win32_UI_Shell"] }
+windows-core = "0.62"
+
+[build-dependencies]
+cc = "1.7.0"
+tauri-build = { version = "2", features = [] }
