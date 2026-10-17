@@ -202,6 +202,21 @@ fn config_path(app: &AppHandle) -> PathBuf {
     app.path().app_config_dir().expect("config dir").join("settings.json")
 }
 
+/// 0.1.1 and earlier used the app id com.television.app (Windows Search showed no icon for it),
+/// so their settings live in that folder: carried over once.
+// ponytail: drop this once nobody updates from 0.1.1 anymore.
+fn migrate_config(app: &AppHandle) {
+    let dir = app.path().app_config_dir().expect("config dir");
+    let old = dir.with_file_name("com.television.app");
+    if dir.exists() || !old.exists() {
+        return;
+    }
+    let _ = fs::create_dir_all(&dir);
+    for f in ["settings.json", "window-height"] {
+        let _ = fs::copy(old.join(f), dir.join(f));
+    }
+}
+
 /// A new, unused clip path. The empty file reserves the name, so two saves in the same second
 /// get "… (2)" instead of writing into one file.
 fn clip_path(s: &Settings) -> Result<String, String> {
@@ -298,17 +313,23 @@ async fn update_settings(app: AppHandle, state: State<'_, Mutex<App>>, mut setti
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     settings.sanitize();
     let (old_hotkey, failed) = { let a = state.lock().unwrap(); (a.settings.hotkey.clone(), a.hotkey_error.is_some()) };
-    // A hotkey that failed to register (taken by another app) is retried even if unchanged.
-    let new_hotkey = settings.hotkey != old_hotkey || failed;
-    if new_hotkey {
+    // A hotkey that failed to register (taken by another app) is retried even if unchanged; if
+    // it's still taken, the rest of the settings apply and the warning stays.
+    let changed = settings.hotkey != old_hotkey;
+    let mut registered = false;
+    if changed || failed {
         let gs = app.global_shortcut();
-        gs.register(settings.hotkey.as_str()).map_err(|e| format!("Can't use that hotkey: {e}"))?;
-        if settings.hotkey != old_hotkey {
+        match gs.register(settings.hotkey.as_str()) {
+            Ok(()) => registered = true,
+            Err(e) if changed => return Err(format!("Can't use that hotkey: {e}")),
+            Err(_) => {}
+        }
+        if changed {
             let _ = gs.unregister(old_hotkey.as_str());
         }
     }
     let mut a = state.lock().unwrap();
-    if new_hotkey {
+    if registered {
         a.hotkey_error = None;
     }
     if settings.folder.is_empty() {
@@ -431,6 +452,7 @@ fn main() {
             // delete a running instance's buffer: it's leftovers from a crash.
             let _ = fs::remove_dir_all(recorder::temp_root());
             let h = app.handle();
+            migrate_config(h);
             let mut settings: Settings = fs::read_to_string(config_path(h)).ok()
                 .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             settings.sanitize();

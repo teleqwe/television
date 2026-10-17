@@ -311,6 +311,23 @@ mod tests {
     }
 
     #[test]
+    fn disk_write_errors_leave_earlier_data_readable() {
+        let dir = std::env::temp_dir().join(format!("television-test-err-{}", std::process::id()));
+        let mut d = DiskStore::new(dir.clone(), 4).unwrap();
+        let first = d.write(&[7; 4]).unwrap(); // fills chunk 0
+        fs::create_dir(dir.join("1")).unwrap(); // chunk 1 can't be created
+        assert!(d.write(&[8; 4]).is_err());
+        fs::remove_dir(dir.join("1")).unwrap();
+        let next = d.write(&[9; 4]).unwrap(); // recovers into chunk 1
+        let (mut files, mut buf) = (HashMap::new(), Vec::new());
+        assert_eq!(read(&first, Some(&dir), &mut files, &mut buf).unwrap(), &[7; 4]);
+        assert_eq!(read(&next, Some(&dir), &mut files, &mut buf).unwrap(), &[9; 4]);
+        assert!(matches!(next, Data::Disk { chunk: 1, off: 0, .. }));
+        drop(files);
+        drop(d);
+    }
+
+    #[test]
     fn disk_ring_reads_back_and_deletes_old_chunks() {
         let dir = std::env::temp_dir().join(format!("television-test-{}", std::process::id()));
         let mut r = Ring::new(2, Some(DiskStore::new(dir.clone(), 1000).unwrap()));
