@@ -9,21 +9,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
-/// Shared clock for audio and video, in 100 ns units (same units WASAPI reports).
+/// Shared clock for audio and video, in 100 ns units: CLOCK_MONOTONIC, which PipeWire stamps
+/// audio packets with.
 pub fn now_100ns() -> i64 {
-    let (mut c, mut f) = (0, 0);
-    unsafe {
-        let _ = QueryPerformanceCounter(&mut c);
-        let _ = QueryPerformanceFrequency(&mut f);
-    }
-    (c as i128 * 10_000_000 / f as i128) as i64
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    t.tv_sec * 10_000_000 + t.tv_nsec / 100
 }
 
-/// Where disk buffers live; wiped at startup in case a previous run crashed.
+/// Where disk buffers live; wiped at startup in case a previous run crashed. Under the user's
+/// cache folder, not /tmp: that's often a RAM disk, which would defeat the point.
 pub fn temp_root() -> PathBuf {
-    std::env::temp_dir().join("Television")
+    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    cache.join("television").join("buffer")
 }
 
 #[derive(Clone)]
@@ -194,6 +195,8 @@ pub struct Session {
     pub muted: Arc<Vec<AtomicBool>>, // desktop, mic, then one per app
     pub size: (u32, u32),
     pub preview: Arc<video::Preview>,
+    pub token: Option<String>, // portal restore token for the next session
+    pub source: String,
 }
 
 impl Session {
@@ -212,8 +215,11 @@ impl Session {
         let muted = [s.desktop_muted, s.mic_muted].into_iter().chain(s.apps.iter().map(|a| a.muted)).map(AtomicBool::new).collect();
         let muted = Arc::new(muted);
         let preview = Arc::new(video::Preview::default());
-        let (vt, vp, w, h) = video::start(s, t0, stop.clone(), ring.clone(), preview.clone())?;
-        let mut sess = Session { stop, threads: vec![vt], ring, streams: vec![("Video".into(), Arc::new(vp))], muted, size: (w, h), preview };
+        let v = video::start(s, t0, stop.clone(), ring.clone(), preview.clone())?;
+        let mut sess = Session {
+            stop, threads: vec![v.thread], ring, streams: vec![("Video".into(), Arc::new(v.params))], muted, size: v.size, preview,
+            token: v.token, source: v.source,
+        };
         // On error, dropping `sess` stops the video thread.
         let (at, tracks) = audio::start(s, t0, sess.stop.clone(), sess.ring.clone(), sess.muted.clone())?;
         sess.threads.extend(at);

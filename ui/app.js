@@ -10,7 +10,6 @@ const INFO = '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.3"/><path d="M
 
 let st = null; // current settings
 let last; // last status from the backend
-let sources = [];
 let devices = { out: [], in: [] };
 let audioApps = [];
 
@@ -18,8 +17,8 @@ const prettyKey = (hk) => hk.replace(/\bKey([A-Z])\b/g, '$1').replace(/\bDigit(\
 const appName = (exe) => exe.replace(/\.exe$/i, '');
 
 function shortPath(p) {
-  const parts = p.split('\\');
-  return parts.length > 3 ? '…\\' + parts.slice(-2).join('\\') : p;
+  const parts = p.split('/').filter(Boolean);
+  return parts.length > 3 ? '…/' + parts.slice(-2).join('/') : p;
 }
 
 // Rough size of the buffer: (video + audio bitrate) × clip length.
@@ -38,25 +37,11 @@ function setOptions(sel, opts, value) {
   sel.value = value;
 }
 
-function renderSources() {
-  const opts = [['auto', 'Automatic'], ...sources.map((s) => [s.id, s.name])];
-  // A saved window that isn't listed as-is still shows, so the selection doesn't silently change.
-  // Ids are "window:<hwnd>:<exe>"; if the app reopened, the backend follows it to its new window.
-  if (st.source.startsWith('window:') && !sources.some((s) => s.id === st.source)) {
-    const exe = st.source.split(':')[2];
-    const same = exe && sources.find((s) => s.id.startsWith('window:') && s.id.split(':')[2] === exe);
-    opts.push([st.source, same ? same.name : 'Closed window']);
-  }
-  // "monitor:" and unknown monitors mean the primary display, which is listed first.
-  const known = opts.some(([v]) => v === st.source);
-  setOptions($('#source'), opts, known ? st.source : sources[0]?.id);
-}
-
 function renderDevices() {
   for (const sel of $$('[data-devices]')) {
     const list = devices[sel.dataset.devices];
     const value = st[sel.dataset.k];
-    const opts = [['', 'Windows default'], ...list.map((d) => [d.id, d.name])];
+    const opts = [['', 'System default'], ...list.map((d) => [d.id, d.name])];
     if (value && !list.some((d) => d.id === value)) opts.push([value, 'Unavailable device']);
     setOptions(sel, opts, value);
   }
@@ -92,6 +77,7 @@ function renderStatus(s) {
   $('#status').textContent = s.running
     ? `Buffering · ${full ? '' : Math.floor(s.buffered) + ' / '}${st.clip_seconds} s · ${s.height}p${st.fps}`
     : err ? 'Not buffering' : 'Starting…';
+  $('#source').textContent = s.source || 'Choose…';
   $('#error').hidden = !err;
   $('#error').textContent = err || '';
 }
@@ -99,11 +85,10 @@ function renderStatus(s) {
 function render(s) {
   st = s.settings;
   for (const e of $$('[data-k]')) {
-    if (e.id === 'source' || 'devices' in e.dataset || (e === document.activeElement && e.type === 'number')) continue;
+    if ('devices' in e.dataset || (e === document.activeElement && e.type === 'number')) continue;
     if (e.type === 'checkbox') e.checked = st[e.dataset.k];
     else e.value = String(st[e.dataset.k]);
   }
-  renderSources();
   renderDevices();
   renderApps();
   for (const row of $$('[data-show]')) {
@@ -187,9 +172,13 @@ $('#folder').onclick = async () => {
   const dir = await invoke('pick_folder');
   if (dir) update({ folder: dir });
 };
-$('#refresh').onclick = async () => {
-  sources = await invoke('list_sources');
-  renderSources();
+$('#source').onclick = async () => {
+  $('#source').textContent = 'Waiting for the dialog…';
+  try {
+    render((last = await invoke('pick_source')));
+  } catch (e) {
+    toast(String(e), true);
+  }
 };
 
 // Info icons: one per row with a data-tip, shown in a floating tooltip on hover or focus.
@@ -286,13 +275,13 @@ try { setPreview(!!localStorage.getItem('preview')); } catch {}
 
 // The global hotkey or tray can save while the window is open.
 listen('clip', ({ payload }) => {
-  if (payload.Ok) toast(`Saved ${payload.Ok.split('\\').pop()}`, false, { label: 'Show', run: () => invoke('open_folder') });
+  if (payload.Ok) toast(`Saved ${payload.Ok.split('/').pop()}`, false, { label: 'Show', run: () => invoke('open_folder') });
   else toast(payload.Err, true);
 });
 
 (async () => {
-  [last, sources, devices.out, devices.in, audioApps] = await Promise.all([
-    invoke('get_status'), invoke('list_sources'),
+  [last, devices.out, devices.in, audioApps] = await Promise.all([
+    invoke('get_status'),
     invoke('list_audio_devices', { mic: false }), invoke('list_audio_devices', { mic: true }), invoke('list_audio_apps'),
   ]);
   render(last);

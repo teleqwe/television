@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Television
+GenericName=Replay buffer
+Comment=Keeps the last minute of your screen and saves it as a clip on a hotkey
+Exec=television
+Icon=television
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=clip;replay;record;shadowplay;nvenc;
+StartupWMClass=television

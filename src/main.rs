@@ -1,6 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod audio;
 mod ff;
+mod hotkey;
+mod pw;
 mod recorder;
 mod video;
 
@@ -14,12 +15,7 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-use windows::core::w;
-use windows::Win32::System::Registry::{RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
-use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows::Win32::UI::WindowsAndMessaging::{MB_ICONHAND, MB_OK};
+use tauri_plugin_global_shortcut::ShortcutState;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(default)]
@@ -31,7 +27,7 @@ pub struct AppTrack {
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Settings {
-    pub source: String, // "auto", "monitor:<device name>" or "window:<hwnd>"
+    pub restore_token: String, // the desktop portal's token for the picked screen/window ("" = ask)
     pub output_height: u32, // 0 = same as source
     pub cursor: bool,
     pub fps: u32,
@@ -51,7 +47,7 @@ pub struct Settings {
     pub mic: bool,
     pub desktop_muted: bool,
     pub mic_muted: bool,
-    pub desktop_device: String, // "" = Windows default
+    pub desktop_device: String, // PipeWire node name, "" = system default
     pub mic_device: String,
     pub apps: Vec<AppTrack>,
     pub audio_bitrate: u32, // kbps
@@ -66,7 +62,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            source: "auto".into(),
+            restore_token: String::new(),
             output_height: 0,
             cursor: true,
             fps: 60,
@@ -104,7 +100,7 @@ impl Settings {
     /// Whether going from `self` to `new` needs capture and encoders restarted (clears the buffer).
     fn needs_restart(&self, new: &Settings) -> bool {
         let core = |s: &Settings| Settings {
-            desktop_muted: false, mic_muted: false, clip_seconds: 0, autostart: false,
+            desktop_muted: false, mic_muted: false, clip_seconds: 0, autostart: false, restore_token: String::new(),
             apps: s.apps.iter().map(|a| AppTrack { muted: false, ..a.clone() }).collect(),
             hotkey: String::new(), folder: String::new(), container: String::new(), ..s.clone()
         };
@@ -130,8 +126,8 @@ impl Settings {
         self.bframes = self.bframes.min(4);
         self.audio_bitrate = self.audio_bitrate.clamp(64, 320);
         self.clip_seconds = self.clip_seconds.clamp(5, 1800);
-        // Strings that reach Windows/FFmpeg as C strings can't hold NULs.
-        for s in [&mut self.source, &mut self.desktop_device, &mut self.mic_device, &mut self.hotkey, &mut self.folder] {
+        // Strings that reach PipeWire/FFmpeg as C strings can't hold NULs.
+        for s in [&mut self.restore_token, &mut self.desktop_device, &mut self.mic_device, &mut self.hotkey, &mut self.folder] {
             s.retain(|c| c != '\0');
         }
         self.apps.iter_mut().for_each(|a| a.exe.retain(|c| c != '\0'));
@@ -142,33 +138,64 @@ impl Settings {
     }
 }
 
-/// Adds or removes Television from the per-user startup programs (starts in the tray).
+/// Adds or removes Television from the programs started at login (starts in the tray).
 fn set_autostart(on: bool) {
-    let run = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    unsafe {
-        if on {
-            let exe = std::env::current_exe().unwrap_or_default();
-            let cmd: Vec<u16> = format!("\"{}\" --tray", exe.display()).encode_utf16().chain([0]).collect();
-            let _ = RegSetKeyValueW(HKEY_CURRENT_USER, run, w!("Television"), REG_SZ.0, Some(cmd.as_ptr() as _), cmd.len() as u32 * 2);
-        } else {
-            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, run, w!("Television"));
-        }
+    let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    else {
+        return;
+    };
+    let file = dir.join("autostart").join("television.desktop");
+    if on {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let exe = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let entry = format!("[Desktop Entry]\nType=Application\nName=Television\nExec=\"{exe}\" --tray\nIcon=television\nX-GNOME-Autostart-enabled=true\n");
+        let _ = fs::create_dir_all(file.parent().unwrap());
+        let _ = fs::write(file, entry);
+    } else {
+        let _ = fs::remove_file(file);
+    }
+}
+
+/// Plays a freedesktop theme sound (feedback for a save from the hotkey, which may be in a game).
+fn play_sound(name: &str) {
+    use std::process::{Command, Stdio};
+    let quiet = |c: &mut Command| { c.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(|mut p| thread::spawn(move || p.wait())) };
+    if quiet(Command::new("canberra-gtk-play").args(["-i", name])).is_err() {
+        let _ = quiet(Command::new("pw-play").arg(format!("/usr/share/sounds/freedesktop/stereo/{name}.oga")));
     }
 }
 
 struct App {
     settings: Settings,
+    config: PathBuf, // settings.json
     session: Option<Session>,
     error: Option<String>, // why the session couldn't start
     hotkey_error: Option<String>, // buffering works, but the hotkey doesn't
 }
 
 impl App {
+    /// Starts the buffer over. Without a saved restore token this opens the portal's picker and
+    /// waits for the user.
     fn restart(&mut self) {
         self.session = None; // stop the old capture before opening a new one
-        match Session::start(&self.settings) {
-            Ok(s) => (self.session, self.error) = (Some(s), None),
+        let token = std::mem::take(&mut self.settings.restore_token); // tokens are single-use
+        match Session::start(&Settings { restore_token: token, ..self.settings.clone() }) {
+            Ok(s) => {
+                self.settings.restore_token = s.token.clone().unwrap_or_default();
+                (self.session, self.error) = (Some(s), None);
+            }
             Err(e) => self.error = Some(e),
+        }
+        self.save();
+    }
+
+    fn save(&self) {
+        let _ = fs::create_dir_all(self.config.parent().unwrap());
+        // Written aside then renamed over, so a crash mid-write can't leave a torn settings.json.
+        let tmp = self.config.with_extension("tmp");
+        if fs::write(&tmp, serde_json::to_string_pretty(&self.settings).unwrap()).is_ok() {
+            let _ = fs::rename(tmp, &self.config);
         }
     }
 }
@@ -181,6 +208,7 @@ struct Status {
     buffered: f64, // seconds
     width: u32,
     height: u32,
+    source: String,
 }
 
 fn status(a: &App) -> Status {
@@ -195,6 +223,7 @@ fn status(a: &App) -> Status {
         buffered: ring.map_or(0.0, |r| r.buffered_us() as f64 / 1e6),
         width: s.map_or(0, |s| s.size.0),
         height: s.map_or(0, |s| s.size.1),
+        source: s.map_or(String::new(), |s| s.source.clone()),
     }
 }
 
@@ -202,30 +231,16 @@ fn config_path(app: &AppHandle) -> PathBuf {
     app.path().app_config_dir().expect("config dir").join("settings.json")
 }
 
-/// 0.1.1 and earlier used the app id com.television.app (Windows Search showed no icon for it),
-/// so their settings live in that folder: carried over once.
-// ponytail: drop this once nobody updates from 0.1.1 anymore.
-fn migrate_config(app: &AppHandle) {
-    let dir = app.path().app_config_dir().expect("config dir");
-    copy_config(&dir.with_file_name("com.television.app"), &dir);
-}
-
-fn copy_config(old: &std::path::Path, dir: &std::path::Path) {
-    if dir.exists() || !old.exists() {
-        return;
-    }
-    let _ = fs::create_dir_all(dir);
-    for f in ["settings.json", "window-height"] {
-        let _ = fs::copy(old.join(f), dir.join(f));
-    }
-}
-
 /// A new, unused clip path. The empty file reserves the name, so two saves in the same second
 /// get "… (2)" instead of writing into one file.
 fn clip_path(s: &Settings) -> Result<String, String> {
     fs::create_dir_all(&s.folder).map_err(|e| format!("Can't create {}: {e}", s.folder))?;
-    let t = unsafe { GetLocalTime() };
-    let base = format!("Television {:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    let t = unsafe {
+        let (now, mut t) = (libc::time(std::ptr::null_mut()), std::mem::zeroed::<libc::tm>());
+        libc::localtime_r(&now, &mut t);
+        t
+    };
+    let base = format!("Television {:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
     for n in 1.. {
         let name = if n == 1 { format!("{base}.{}", s.container) } else { format!("{base} ({n}).{}", s.container) };
         let path = PathBuf::from(&s.folder).join(name);
@@ -238,25 +253,24 @@ fn clip_path(s: &Settings) -> Result<String, String> {
     unreachable!()
 }
 
-fn save_clip(app: &AppHandle) {
-    let state = app.state::<Mutex<App>>();
-    let a = state.lock().unwrap();
-    let job = match &a.session {
-        Some(s) => Ok((s.ring.clone(), s.streams.clone(), a.settings.clone())),
-        None => Err("Not buffering, so there's nothing to save.".to_string()),
-    };
-    drop(a);
+pub fn save_clip(app: &AppHandle) {
     let app = app.clone();
-    // Off the hotkey/tray (main) thread: the clips folder may be slow (e.g. a network drive).
+    // Off the hotkey/tray (main) thread: the clips folder may be slow (e.g. a network drive), and
+    // a restart may hold the lock while the source picker is open.
     thread::spawn(move || {
+        let state = app.state::<Mutex<App>>();
+        let a = state.lock().unwrap();
+        let job = match &a.session {
+            Some(s) => Ok((s.ring.clone(), s.streams.clone(), a.settings.clone())),
+            None => Err("Not buffering, so there's nothing to save.".to_string()),
+        };
+        drop(a);
         thread::sleep(Duration::from_millis(300)); // let in-flight audio reach the buffer
         let r = job.and_then(|(ring, streams, s)| {
             let p = clip_path(&s)?;
             recorder::save(&ring, &streams, &p).map(|_| p)
         });
-        unsafe {
-            let _ = MessageBeep(if r.is_ok() { MB_OK } else { MB_ICONHAND });
-        }
+        play_sound(if r.is_ok() { "camera-shutter" } else { "dialog-error" });
         let _ = app.emit("clip", r);
     });
 }
@@ -314,13 +328,17 @@ async fn get_status(state: State<'_, Mutex<App>>) -> Result<Status, String> {
     Ok(status(&state.lock().unwrap()))
 }
 
+/// Forgets the picked screen/window and opens the portal's picker again.
 #[tauri::command]
-fn list_sources() -> Vec<video::Source> {
-    video::list_sources()
+async fn pick_source(state: State<'_, Mutex<App>>) -> Result<Status, String> {
+    let mut a = state.lock().unwrap();
+    a.settings.restore_token.clear();
+    a.restart();
+    Ok(status(&a))
 }
 
 #[tauri::command]
-async fn update_settings(app: AppHandle, state: State<'_, Mutex<App>>, mut settings: Settings) -> Result<Status, String> {
+async fn update_settings(app: AppHandle, state: State<'_, Mutex<App>>, hotkeys: State<'_, hotkey::Hotkey>, mut settings: Settings) -> Result<Status, String> {
     // One update at a time: the UI can send a second before the first returns.
     static ONE: Mutex<()> = Mutex::new(());
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
@@ -331,11 +349,7 @@ async fn update_settings(app: AppHandle, state: State<'_, Mutex<App>>, mut setti
     let changed = settings.hotkey != old_hotkey;
     let mut registered = false;
     if changed || failed {
-        let gs = app.global_shortcut();
-        registered = hotkey_outcome(changed, gs.register(settings.hotkey.as_str()).map_err(|e| e.to_string()))?;
-        if changed {
-            let _ = gs.unregister(old_hotkey.as_str());
-        }
+        registered = hotkey_outcome(changed, hotkeys.set(&app, &settings.hotkey, changed.then_some(old_hotkey.as_str())))?;
     }
     let mut a = state.lock().unwrap();
     if registered {
@@ -344,16 +358,12 @@ async fn update_settings(app: AppHandle, state: State<'_, Mutex<App>>, mut setti
     if settings.folder.is_empty() {
         settings.folder = a.settings.folder.clone();
     }
+    // Only the backend knows the current token (the UI's copy may be from before a restart).
+    settings.restore_token = a.settings.restore_token.clone();
     let restart = a.settings.needs_restart(&settings);
     let autostart_was = a.settings.autostart;
     a.settings = settings;
-    let path = config_path(&app);
-    let _ = fs::create_dir_all(path.parent().unwrap());
-    // Written aside then renamed over, so a crash mid-write can't leave a torn settings.json.
-    let tmp = path.with_extension("tmp");
-    if fs::write(&tmp, serde_json::to_string_pretty(&a.settings).unwrap()).is_ok() {
-        let _ = fs::rename(tmp, path);
-    }
+    a.save();
     if a.settings.autostart != autostart_was {
         set_autostart(a.settings.autostart);
     }
@@ -375,7 +385,7 @@ fn list_audio_devices(mic: bool) -> Vec<audio::Device> {
 
 #[tauri::command]
 fn list_audio_apps() -> Vec<String> {
-    audio::list_apps(video::window_pids())
+    audio::list_apps()
 }
 
 /// The newest preview frame (see `video::Preview`), and asks for the next one. Empty until the
@@ -399,7 +409,7 @@ fn save_clip_now(app: AppHandle) {
 fn open_folder(state: State<Mutex<App>>) {
     let folder = state.lock().unwrap().settings.folder.clone();
     let _ = fs::create_dir_all(&folder);
-    let _ = std::process::Command::new("explorer").arg(folder).spawn();
+    let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
 }
 
 #[tauri::command]
@@ -416,21 +426,6 @@ mod tests {
         assert!(super::hotkey_outcome(true, taken()).is_err()); // newly picked and taken: rejected
         assert_eq!(super::hotkey_outcome(true, Ok(())), Ok(true));
         assert_eq!(super::hotkey_outcome(false, Ok(())), Ok(true)); // retry worked: warning clears
-    }
-
-    #[test]
-    fn old_config_is_copied_once() {
-        let root = std::env::temp_dir().join(format!("television-migrate-{}", std::process::id()));
-        let (old, new) = (root.join("com.television.app"), root.join("com.teleqwe.television"));
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join("settings.json"), "{\"fps\":144}").unwrap();
-        super::copy_config(&old, &new);
-        assert_eq!(std::fs::read_to_string(new.join("settings.json")).unwrap(), "{\"fps\":144}");
-        assert!(!new.join("window-height").exists()); // missing files are skipped
-        std::fs::write(old.join("settings.json"), "{}").unwrap();
-        super::copy_config(&old, &new); // already migrated: left alone
-        assert_eq!(std::fs::read_to_string(new.join("settings.json")).unwrap(), "{\"fps\":144}");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -455,6 +450,11 @@ mod tests {
 }
 
 fn main() {
+    // WebKitGTK's DMA-BUF renderer shows a blank or flickering window with some NVIDIA drivers;
+    // a settings window doesn't need it.
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+    }
     // `television --smoke out.mp4 [settings json]`: buffer ~6 s headless, save, exit.
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--smoke") {
@@ -463,9 +463,11 @@ fn main() {
             None => Settings { mic: true, clip_seconds: 4, ..Default::default() },
         };
         let sess = Session::start(&s).expect("start");
+        println!("source: {}", sess.source);
         thread::sleep(Duration::from_secs(6));
         recorder::save(&sess.ring, &sess.streams, &args[i + 1]).expect("save");
         println!("saved, size {:?}, error: {:?}", sess.size, sess.ring.lock().unwrap().error);
+        println!("restore token: {}", sess.token.as_deref().unwrap_or(""));
         return;
     }
     let tray_only = args.iter().any(|a| a == "--tray");
@@ -478,14 +480,13 @@ fn main() {
             .with_handler(|app, _, e| if e.state() == ShortcutState::Pressed { save_clip(app) })
             .build())
         .invoke_handler(tauri::generate_handler![
-            get_status, list_sources, list_audio_devices, list_audio_apps, update_settings, get_preview, save_clip_now, open_folder, pick_folder
+            get_status, pick_source, list_audio_devices, list_audio_apps, update_settings, get_preview, save_clip_now, open_folder, pick_folder
         ])
         .setup(move |app| {
             // Only the first instance gets here (single-instance runs first), so this can't
             // delete a running instance's buffer: it's leftovers from a crash.
             let _ = fs::remove_dir_all(recorder::temp_root());
             let h = app.handle();
-            migrate_config(h);
             let mut settings: Settings = fs::read_to_string(config_path(h)).ok()
                 .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             settings.sanitize();
@@ -493,11 +494,14 @@ fn main() {
                 settings.folder = app.path().video_dir()?.join("Television").to_string_lossy().into_owned();
             }
             set_autostart(settings.autostart); // matches the setting, and keeps the path current if the exe moved
-            let hotkey_error = app.global_shortcut().register(settings.hotkey.as_str()).err()
+            let hotkeys = hotkey::Hotkey::new(h);
+            let hotkey_error = hotkeys.set(h, &settings.hotkey, None).err()
                 .map(|e| format!("Can't use hotkey {}: {e}. Pick another under Clips.", settings.hotkey));
-            let mut a = App { settings, session: None, error: None, hotkey_error };
-            a.restart();
-            app.manage(Mutex::new(a));
+            app.manage(hotkeys);
+            app.manage(Mutex::new(App { settings, config: config_path(h), session: None, error: None, hotkey_error }));
+            // Off the main thread: the first start may open the source picker and wait on it.
+            let first = h.clone();
+            thread::spawn(move || first.state::<Mutex<App>>().lock().unwrap().restart());
 
             // Self-healing for days-long runs: if the buffer dies (GPU driver reset after a game
             // crash, disk full, ...) restart it; if it couldn't start, retry every 30 s.
@@ -508,7 +512,9 @@ fn main() {
                     let state = watch.state::<Mutex<App>>();
                     let mut a = state.lock().unwrap();
                     let died = a.session.as_ref().is_some_and(|s| !s.alive() || s.ring.lock().unwrap().error.is_some());
-                    if died || (a.session.is_none() && tick % 6 == 0) {
+                    // Not after the picker was dismissed: that would just open it again.
+                    let waiting = a.error.as_deref() == Some(video::CANCELLED);
+                    if died || (a.session.is_none() && tick % 6 == 0 && !waiting) {
                         a.restart();
                     }
                 }

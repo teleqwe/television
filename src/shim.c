@@ -1,23 +1,21 @@
-// Thin FFmpeg wrapper: NVENC video from D3D11 textures, AAC audio, and muxing
-// buffered packets to a file. Rust calls these through src/ff.rs.
-#define COBJMACROS
-#include <d3d11.h>
+// Thin FFmpeg wrapper: NVENC video from captured frames (in memory, or CUDA frames from
+// src/gpu.c), AAC audio, and muxing buffered packets to a file. Rust calls these through src/ff.rs.
 #include <stdio.h>
+#include <string.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libswscale/swscale.h>
 
 typedef struct {
     AVCodecContext *ctx;
-    AVFrame *frame;          // audio: frame being filled
+    AVFrame *frame;          // audio: frame being filled; video: frame sent to the encoder
     AVPacket *pkt;
-    ID3D11DeviceContext *dc; // video: immediate context for the copy
-    ID3D11VideoDevice *vdev; // video: scaler (owned by FFmpeg's device context)
-    ID3D11VideoContext *vctx;
-    ID3D11VideoProcessorEnumerator *vpe;
-    ID3D11VideoProcessor *vp;
-    int vp_w, vp_h;          // source size the scaler was built for
+    struct SwsContext *sws;  // video: scaler for frames that aren't the encoder size or format
+    AVFrame *scaled;         // video: the scaler's output, before it's placed in `frame`
+    int sws_w, sws_h, sws_fmt; // source the scaler was built for
     int64_t next_pts;        // audio: samples sent so far
     int npend;               // audio: samples already in frame
 } Enc;
@@ -40,8 +38,8 @@ static void fail(char *err, const char *what, int ret) {
 
 void enc_close(Enc *e) {
     if (!e) return;
-    if (e->vp) ID3D11VideoProcessor_Release(e->vp);
-    if (e->vpe) ID3D11VideoProcessorEnumerator_Release(e->vpe);
+    sws_freeContext(e->sws);
+    av_frame_free(&e->scaled);
     avcodec_free_context(&e->ctx);
     av_frame_free(&e->frame);
     av_packet_free(&e->pkt);
@@ -63,115 +61,117 @@ static int open_enc(Enc *e, const AVCodec *c, const char *opts, char *err) {
     return ret;
 }
 
-Enc *vid_open(ID3D11Device *dev, int w, int h, int fps, const char *codec, const char *opts, char *err) {
+// `fmt` is the AVPixelFormat frames arrive in (packed 32-bit RGB, which NVENC converts to YUV itself).
+Enc *vid_open(int w, int h, int fps, int fmt, const char *codec, const char *opts, char *err) {
     av_log_set_level(AV_LOG_ERROR); // vid_open runs first in every session
     const AVCodec *c = avcodec_find_encoder_by_name(codec);
     if (!c) { snprintf(err, 256, "encoder '%s' not found", codec); return NULL; }
 
     Enc *e = av_mallocz(sizeof *e);
-    AVBufferRef *dref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA), *fref = NULL;
-    AVD3D11VADeviceContext *d3d = ((AVHWDeviceContext *)dref->data)->hwctx;
-    ID3D11Device_AddRef(dev); // FFmpeg releases it when the device context is freed
-    d3d->device = dev;
-    int ret = av_hwdevice_ctx_init(dref);
-    if (ret < 0) { fail(err, "d3d11 device", ret); goto out; }
-    e->dc = d3d->device_context;
-    e->vdev = d3d->video_device;
-    e->vctx = d3d->video_context;
-
-    fref = av_hwframe_ctx_alloc(dref);
-    AVHWFramesContext *fc = (AVHWFramesContext *)fref->data;
-    fc->format = AV_PIX_FMT_D3D11;
-    fc->sw_format = AV_PIX_FMT_BGRA; // NVENC converts RGB->YUV itself
-    fc->width = w;
-    fc->height = h;
-    ((AVD3D11VAFramesContext *)fc->hwctx)->BindFlags = D3D11_BIND_RENDER_TARGET;
-    ret = av_hwframe_ctx_init(fref);
-    if (ret < 0) { fail(err, "d3d11 frames", ret); goto out; }
-
     e->ctx = avcodec_alloc_context3(c);
     e->ctx->width = w;
     e->ctx->height = h;
     e->ctx->time_base = (AVRational){1, fps};
     e->ctx->framerate = (AVRational){fps, 1};
-    e->ctx->pix_fmt = AV_PIX_FMT_D3D11;
-    e->ctx->hw_frames_ctx = av_buffer_ref(fref);
+    e->ctx->pix_fmt = fmt;
     e->ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     e->pkt = av_packet_alloc();
-    ret = open_enc(e, c, opts, err);
-out:
-    av_buffer_unref(&fref);
-    av_buffer_unref(&dref);
+    e->frame = av_frame_alloc();
+    e->frame->format = fmt;
+    e->frame->width = w;
+    e->frame->height = h;
+    int ret = av_frame_get_buffer(e->frame, 0);
+    if (ret < 0) fail(err, "frame", ret);
+    else ret = open_enc(e, c, opts, err);
     if (ret < 0) { enc_close(e); return NULL; }
     return e;
 }
 
-// Scales `src` (sw x sh) into the frame with the GPU video processor, keeping the aspect
-// ratio (black bars fill the rest).
-static int scale(Enc *e, ID3D11Texture2D *src, int sw, int sh, AVFrame *f) {
-    int ow = e->ctx->width, oh = e->ctx->height;
-    HRESULT hr;
-    if (!e->vp || e->vp_w != sw || e->vp_h != sh) {
-        if (e->vp) ID3D11VideoProcessor_Release(e->vp);
-        if (e->vpe) ID3D11VideoProcessorEnumerator_Release(e->vpe);
-        e->vp = NULL;
-        e->vpe = NULL;
-        D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd = {
-            .InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            .InputFrameRate = {e->ctx->framerate.num, 1}, .InputWidth = sw, .InputHeight = sh,
-            .OutputFrameRate = {e->ctx->framerate.num, 1}, .OutputWidth = ow, .OutputHeight = oh,
-            .Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-        };
-        hr = ID3D11VideoDevice_CreateVideoProcessorEnumerator(e->vdev, &cd, &e->vpe);
-        if (SUCCEEDED(hr)) hr = ID3D11VideoDevice_CreateVideoProcessor(e->vdev, e->vpe, 0, &e->vp);
-        if (FAILED(hr)) return AVERROR_EXTERNAL;
-        e->vp_w = sw;
-        e->vp_h = sh;
-        double s = FFMIN((double)ow / sw, (double)oh / sh);
-        int dw = (int)(sw * s) & ~1, dh = (int)(sh * s) & ~1;
-        RECT dst = {(ow - dw) / 2, (oh - dh) / 2, (ow - dw) / 2 + dw, (oh - dh) / 2 + dh};
-        D3D11_VIDEO_COLOR black = {.RGBA = {0, 0, 0, 1}};
-        ID3D11VideoContext_VideoProcessorSetOutputBackgroundColor(e->vctx, e->vp, FALSE, &black);
-        ID3D11VideoContext_VideoProcessorSetStreamDestRect(e->vctx, e->vp, 0, TRUE, &dst);
-        ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(e->vctx, e->vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-        ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(e->vctx, e->vp, 0, FALSE);
-    }
-    UINT idx = (UINT)(intptr_t)f->data[1];
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D};
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = idx
-        ? (D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC){.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2DARRAY, .Texture2DArray = {0, idx, 1}}
-        : (D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC){.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D};
-    ID3D11VideoProcessorInputView *in = NULL;
-    ID3D11VideoProcessorOutputView *out = NULL;
-    hr = ID3D11VideoDevice_CreateVideoProcessorInputView(e->vdev, (ID3D11Resource *)src, e->vpe, &ivd, &in);
-    if (SUCCEEDED(hr))
-        hr = ID3D11VideoDevice_CreateVideoProcessorOutputView(e->vdev, (ID3D11Resource *)f->data[0], e->vpe, &ovd, &out);
-    if (SUCCEEDED(hr)) {
-        D3D11_VIDEO_PROCESSOR_STREAM st = {.Enable = TRUE, .pInputSurface = in};
-        hr = ID3D11VideoContext_VideoProcessorBlt(e->vctx, e->vp, out, 0, 1, &st);
-    }
-    if (in) ID3D11VideoProcessorInputView_Release(in);
-    if (out) ID3D11VideoProcessorOutputView_Release(out);
-    return FAILED(hr) ? AVERROR_EXTERNAL : 0;
+// For CUDA frames from `frames` (an AVHWFramesContext, whose size is the encoder's).
+Enc *vid_open_hw(AVBufferRef *frames, int fps, const char *codec, const char *opts, char *err) {
+    av_log_set_level(AV_LOG_ERROR);
+    const AVCodec *c = avcodec_find_encoder_by_name(codec);
+    if (!c) { snprintf(err, 256, "encoder '%s' not found", codec); return NULL; }
+    AVHWFramesContext *fc = (AVHWFramesContext *)frames->data;
+    Enc *e = av_mallocz(sizeof *e);
+    e->ctx = avcodec_alloc_context3(c);
+    e->ctx->width = fc->width;
+    e->ctx->height = fc->height;
+    e->ctx->time_base = (AVRational){1, fps};
+    e->ctx->framerate = (AVRational){fps, 1};
+    e->ctx->pix_fmt = AV_PIX_FMT_CUDA;
+    e->ctx->sw_pix_fmt = fc->sw_format;
+    e->ctx->hw_frames_ctx = av_buffer_ref(frames);
+    e->ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    e->pkt = av_packet_alloc();
+    if (open_enc(e, c, opts, err) < 0) { enc_close(e); return NULL; }
+    return e;
 }
 
-// Encodes `src` (BGRA, sw x sh): a plain copy when it matches the encoder size, else scaled. GPU only.
-int vid_encode(Enc *e, ID3D11Texture2D *src, int sw, int sh, int64_t pts) {
-    AVFrame *f = av_frame_alloc();
-    int ret = av_hwframe_get_buffer(e->ctx->hw_frames_ctx, f, 0);
-    if (ret >= 0 && sw == e->ctx->width && sh == e->ctx->height) {
-        D3D11_BOX box = {0, 0, 0, sw, sh, 1};
-        ID3D11DeviceContext_CopySubresourceRegion(e->dc, (ID3D11Resource *)f->data[0], (UINT)(intptr_t)f->data[1],
-                                                  0, 0, 0, (ID3D11Resource *)src, 0, &box);
-    } else if (ret >= 0) {
-        ret = scale(e, src, sw, sh, f);
-    }
-    if (ret >= 0) {
-        f->pts = pts;
-        ret = avcodec_send_frame(e->ctx, f);
-    }
+// Encodes CUDA frame `f` (from the encoder's frames context) and frees it.
+int vid_encode_hw(Enc *e, AVFrame *f, int64_t pts) {
+    f->pts = pts;
+    int ret = avcodec_send_frame(e->ctx, f);
     av_frame_free(&f);
     return ret;
+}
+
+// Scales `src` (sw x sh, `fmt`) into the frame, keeping the aspect ratio (black bars fill the rest).
+static int scale(Enc *e, const uint8_t *src, int stride, int sw, int sh, int fmt, AVFrame *f) {
+    int ow = e->ctx->width, oh = e->ctx->height;
+    double s = FFMIN((double)ow / sw, (double)oh / sh);
+    int dw = FFMAX((int)(sw * s) & ~1, 2), dh = FFMAX((int)(sh * s) & ~1, 2);
+    if (!e->sws || e->sws_w != sw || e->sws_h != sh || e->sws_fmt != fmt) {
+        sws_freeContext(e->sws);
+        av_frame_free(&e->scaled);
+        e->sws = sws_alloc_context();
+        av_opt_set_int(e->sws, "srcw", sw, 0);
+        av_opt_set_int(e->sws, "srch", sh, 0);
+        av_opt_set_int(e->sws, "src_format", fmt, 0);
+        av_opt_set_int(e->sws, "dstw", dw, 0);
+        av_opt_set_int(e->sws, "dsth", dh, 0);
+        av_opt_set_int(e->sws, "dst_format", f->format, 0);
+        av_opt_set_int(e->sws, "sws_flags", SWS_BILINEAR, 0);
+        av_opt_set_int(e->sws, "threads", 0, 0); // one per core: a 1440p frame is a lot for one
+        e->scaled = av_frame_alloc();
+        e->scaled->format = f->format;
+        e->scaled->width = dw;
+        e->scaled->height = dh;
+        int ret = sws_init_context(e->sws, NULL, NULL);
+        if (ret >= 0) ret = av_frame_get_buffer(e->scaled, 0);
+        if (ret < 0) { sws_freeContext(e->sws); e->sws = NULL; return ret; }
+        e->sws_w = sw;
+        e->sws_h = sh;
+        e->sws_fmt = fmt;
+    }
+    AVFrame *in = av_frame_alloc();
+    in->format = fmt;
+    in->width = sw;
+    in->height = sh;
+    in->data[0] = (uint8_t *)src;
+    in->linesize[0] = stride;
+    int ret = av_frame_make_writable(e->scaled);
+    if (ret >= 0) ret = sws_scale_frame(e->sws, e->scaled, in);
+    av_frame_free(&in);
+    if (ret < 0) return ret;
+    for (int y = 0; y < oh; y++) memset(f->data[0] + (size_t)y * f->linesize[0], 0, (size_t)ow * 4);
+    av_image_copy_plane(f->data[0] + (size_t)((oh - dh) / 2) * f->linesize[0] + (size_t)((ow - dw) / 2) * 4,
+                        f->linesize[0], e->scaled->data[0], e->scaled->linesize[0], dw * 4, dh);
+    return 0;
+}
+
+// Encodes `src` (packed 32-bit `fmt`, sw x sh, `stride` bytes per row): copied when it matches
+// the encoder, else scaled. NVENC uploads it to the GPU and converts to YUV there.
+int vid_encode(Enc *e, const uint8_t *src, int stride, int sw, int sh, int fmt, int64_t pts) {
+    AVFrame *f = e->frame;
+    int ret = av_frame_make_writable(f); // the encoder may still hold the previous frame
+    if (ret < 0) return ret;
+    if (sw == e->ctx->width && sh == e->ctx->height && fmt == f->format)
+        av_image_copy_plane(f->data[0], f->linesize[0], src, stride, sw * 4, sh);
+    else if ((ret = scale(e, src, stride, sw, sh, fmt, f)) < 0)
+        return ret;
+    f->pts = pts;
+    return avcodec_send_frame(e->ctx, f);
 }
 
 // 48 kHz stereo AAC.

@@ -1,22 +1,15 @@
-// Desktop audio (WASAPI loopback), microphone and per-app audio (process loopback), each on
-// its own AAC track, plus a mixed track first (most players and Discord only play track 1).
+// Desktop audio (what the output device plays), microphone and per-app audio, captured with
+// PipeWire, each on its own AAC track, plus a mixed track first (most players and Discord only
+// play track 1).
 use crate::ff::{Encoder, Params};
+use crate::pw::{self, AudioKind, Packets};
 use crate::recorder::{now_100ns, Ring};
 use crate::Settings;
-use std::collections::{BTreeSet, HashMap};
-use std::mem::ManuallyDrop;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use windows::core::{implement, Interface, Result, HRESULT, HSTRING};
-use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, E_FAIL};
-use windows::Win32::Media::Audio::*;
-use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::Win32::System::Com::*;
-use windows::Win32::System::Diagnostics::ToolHelp::*;
-use windows::Win32::System::Variant::VT_BLOB;
 
 const RATE: i64 = 48_000;
 const TOL: i64 = RATE / 50; // 20 ms: beyond this, timing errors are fixed with a jump
@@ -25,16 +18,18 @@ const LAG: i64 = RATE / 10; // silence is filled up to 100 ms behind now
 
 #[derive(Clone)]
 enum Kind {
-    Desktop(String), // device id, "" = Windows default
+    Desktop(String), // output device node name, "" = system default
     Mic(String),
-    App(String), // exe name
+    App(String), // executable name
 }
 
 struct Source {
     kind: Kind,
     mute: usize, // index into the session's mute flags
-    dev: Option<(IAudioClient, IAudioCaptureClient)>,
-    id: Option<String>, // what `dev` captures: device id or process id
+    // PipeWire follows the default device and the app's streams itself, so a stream is only
+    // reopened if opening failed (e.g. PipeWire restarting).
+    dev: Option<pw::Audio>,
+    packets: Arc<Packets>,
     written: i64, // samples (per channel) produced since session start
     pend: Vec<f32>, // interleaved stereo not yet encoded
     next_check: i64,
@@ -42,120 +37,20 @@ struct Source {
     easing: bool, // drift correction in progress (see `place`)
 }
 
-fn enumerator() -> Result<IMMDeviceEnumerator> {
-    unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
-}
-
-fn device_id(d: &IMMDevice) -> Option<String> {
-    unsafe {
-        let p = d.GetId().ok()?;
-        let s = p.to_string().ok();
-        CoTaskMemFree(Some(p.0 as _));
-        s
-    }
-}
-
-/// (pid, parent pid, exe name) of every running process.
-pub fn processes() -> Vec<(u32, u32, String)> {
-    let mut out = Vec::new();
-    unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
-        let mut e = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
-        let mut ok = Process32FirstW(snap, &mut e).is_ok();
-        while ok {
-            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
-            out.push((e.th32ProcessID, e.th32ParentProcessID, String::from_utf16_lossy(&e.szExeFile[..len])));
-            ok = Process32NextW(snap, &mut e).is_ok();
-        }
-        let _ = CloseHandle(snap);
-    }
-    out
-}
-
-/// The root of an app's process tree (apps like Discord or Chrome play audio from child processes).
-fn find_pid(exe: &str) -> Option<u32> {
-    let procs: Vec<_> = processes().into_iter().filter(|p| p.2.eq_ignore_ascii_case(exe)).collect();
-    procs.iter().find(|p| !procs.iter().any(|q| q.0 == p.1)).map(|p| p.0)
-}
-
-/// Identity of what `kind` should capture right now; a change means reopen.
-fn resolve(kind: &Kind) -> Option<String> {
-    let default = |flow| unsafe { enumerator().ok()?.GetDefaultAudioEndpoint(flow, eConsole).ok() };
-    match kind {
-        Kind::Desktop(id) | Kind::Mic(id) if !id.is_empty() => Some(id.clone()),
-        Kind::Desktop(_) => default(eRender).as_ref().and_then(device_id),
-        Kind::Mic(_) => default(eCapture).as_ref().and_then(device_id),
-        Kind::App(exe) => find_pid(exe).map(|p| p.to_string()),
-    }
-}
-
-#[implement(IActivateAudioInterfaceCompletionHandler)]
-struct Activated(Mutex<mpsc::Sender<()>>);
-
-impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
-    fn ActivateCompleted(&self, _: windows::core::Ref<IActivateAudioInterfaceAsyncOperation>) -> Result<()> {
-        let _ = self.0.lock().unwrap().send(());
-        Ok(())
-    }
-}
-
-/// An audio client that captures only `pid` and its child processes (Windows 10 2004+).
-fn process_loopback(pid: u32) -> Result<IAudioClient> {
-    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
-        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
-            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-                TargetProcessId: pid,
-                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
-            },
-        },
+fn open(kind: &Kind, packets: &Arc<Packets>) -> Result<pw::Audio, String> {
+    let kind = match kind {
+        Kind::Desktop(d) => AudioKind::Output(d),
+        Kind::Mic(d) => AudioKind::Input(d),
+        Kind::App(exe) => AudioKind::App(exe),
     };
-    // A VT_BLOB pointing at `params`. ManuallyDrop: PROPVARIANT's Drop would PropVariantClear
-    // and try to free our stack blob.
-    let mut pv = ManuallyDrop::new(PROPVARIANT::default());
-    unsafe {
-        let v = &mut *pv.Anonymous.Anonymous;
-        v.vt = VT_BLOB;
-        v.Anonymous.blob = BLOB { cbSize: size_of_val(&params) as u32, pBlobData: &params as *const _ as *mut u8 };
-    }
-    let (tx, rx) = mpsc::channel();
-    let handler: IActivateAudioInterfaceCompletionHandler = Activated(Mutex::new(tx)).into();
-    let op = unsafe { ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&*pv), &handler)? };
-    rx.recv_timeout(Duration::from_secs(1)).map_err(|_| windows::core::Error::from(E_FAIL))?;
-    let (mut hr, mut client) = (HRESULT(0), None);
-    unsafe { op.GetActivateResult(&mut hr, &mut client)? };
-    hr.ok()?;
-    client.ok_or(windows::core::Error::from(E_FAIL))?.cast()
-}
-
-fn open(kind: &Kind, id: &str) -> Result<(IAudioClient, IAudioCaptureClient)> {
-    // Windows converts whatever the device runs at to 48 kHz stereo float for us.
-    let fmt = WAVEFORMATEX {
-        wFormatTag: 3, // WAVE_FORMAT_IEEE_FLOAT
-        nChannels: 2,
-        nSamplesPerSec: RATE as u32,
-        nAvgBytesPerSec: RATE as u32 * 8,
-        nBlockAlign: 8,
-        wBitsPerSample: 32,
-        cbSize: 0,
-    };
-    let mut flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    if !matches!(kind, Kind::Mic(_)) {
-        flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
-    }
-    unsafe {
-        let client: IAudioClient = match kind {
-            Kind::App(_) => process_loopback(id.parse().unwrap_or(0))?,
-            _ => enumerator()?.GetDevice(&HSTRING::from(id))?.Activate(CLSCTX_ALL, None)?,
-        };
-        client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 20_000_000, 0, &fmt, None)?; // 2 s: rides out a slow reopen of another source
-        let cap = client.GetService()?;
-        client.Start()?;
-        Ok((client, cap))
-    }
+    pw::Audio::open(kind, packets.clone())
 }
 
 impl Source {
+    fn new(kind: Kind, mute: usize) -> Self {
+        Source { kind, mute, dev: None, packets: Arc::default(), written: 0, pend: Vec::new(), next_check: 0, last_data: 0, easing: false }
+    }
+
     fn pad(&mut self, n: i64) {
         self.pend.resize(self.pend.len() + n as usize * 2, 0.0);
         self.written += n;
@@ -193,20 +88,11 @@ impl Source {
     }
 
     fn poll(&mut self, t0: i64, now: i64, muted: bool) {
-        // Follow the Windows default device / the app's current process; retry if it went away.
-        if now >= self.next_check {
+        if self.dev.is_none() && now >= self.next_check {
             self.next_check = now + 2 * RATE;
-            let id = resolve(&self.kind);
-            if self.dev.is_none() || id != self.id {
-                self.dev = id.as_ref().and_then(|id| open(&self.kind, id).inspect_err(|e| eprintln!("audio open: {e}")).ok());
-                self.id = id;
-            }
+            self.dev = open(&self.kind, &self.packets).inspect_err(|e| eprintln!("audio open: {e}")).ok();
         }
-        if let Some((_, cap)) = self.dev.clone()
-            && self.read(&cap, t0, now, muted).is_err()
-        {
-            self.dev = None;
-        }
+        self.read(t0, now, muted);
         // Loopback delivers nothing while nothing plays; keep the timeline moving. Only when the
         // device is idle or gone: a slow device (e.g. Bluetooth) still delivering would have its
         // late packets mistaken for overlap and dropped.
@@ -216,24 +102,17 @@ impl Source {
         }
     }
 
-    fn read(&mut self, cap: &IAudioCaptureClient, t0: i64, now: i64, muted: bool) -> Result<()> {
-        unsafe {
-            while cap.GetNextPacketSize()? > 0 {
-                self.last_data = now;
-                let (mut data, mut n, mut flags, mut qpc) = (std::ptr::null_mut(), 0u32, 0u32, 0u64);
-                cap.GetBuffer(&mut data, &mut n, &mut flags, None, Some(&mut qpc))?;
-                // Place the packet by its capture time so audio stays locked to the video clock.
-                // Without a (valid) timestamp, just follow on. Never later than now: one bogus
-                // timestamp must not pad hours of silence.
-                let ts_ok = qpc != 0 && flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0;
-                let drift = if ts_ok { ((qpc as i64 - t0) * RATE / 10_000_000).min(now) - self.written } else { 0 };
-                let silent = muted || flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
-                let samples = (!silent).then(|| std::slice::from_raw_parts(data as *const f32, n as usize * 2));
-                self.place(samples, n as usize, drift);
-                cap.ReleaseBuffer(n)?;
-            }
+    fn read(&mut self, t0: i64, now: i64, muted: bool) {
+        let packets = std::mem::take(&mut *self.packets.lock().unwrap());
+        for (time, samples) in packets {
+            self.last_data = now;
+            // Place the packet by its capture time so audio stays locked to the video clock.
+            // Without a timestamp, just follow on. Never later than now: one bogus timestamp
+            // must not pad hours of silence.
+            let drift = if time > 0 { ((time - t0) * RATE / 10_000_000).min(now) - self.written } else { 0 };
+            let n = samples.len() / 2;
+            self.place((!muted).then_some(&samples[..]), n, drift);
         }
-        Ok(())
     }
 }
 
@@ -263,9 +142,8 @@ pub fn start(
     let tracks = names.into_iter().zip(&encs).map(|(n, e)| (n, e.params())).collect();
 
     let handle = thread::spawn(move || {
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let mut srcs: Vec<Source> = srcs.into_iter()
-            .map(|(kind, mute, _)| Source { kind, mute, dev: None, id: None, written: 0, pend: Vec::new(), next_check: 0, last_data: 0, easing: false })
+            .map(|(kind, mute, _)| Source::new(kind, mute))
             .collect();
         let mut emitted = 0;
         let mut mixbuf = Vec::new();
@@ -324,47 +202,23 @@ pub struct Device {
     pub name: String,
 }
 
-/// Active output (or input, with `mic`) devices.
+/// Output (or input, with `mic`) devices.
 pub fn list_devices(mic: bool) -> Vec<Device> {
-    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    let list = || -> Result<Vec<Device>> {
-        unsafe {
-            let all = enumerator()?.EnumAudioEndpoints(if mic { eCapture } else { eRender }, DEVICE_STATE_ACTIVE)?;
-            let mut out = Vec::new();
-            for i in 0..all.GetCount()? {
-                let d = all.Item(i)?;
-                let name = d.OpenPropertyStore(STGM_READ)?.GetValue(&PKEY_Device_FriendlyName)?; // freed on drop
-                out.push(Device { id: device_id(&d).unwrap_or_default(), name: name.to_string() });
-            }
-            Ok(out)
-        }
-    };
-    list().unwrap_or_default()
+    let classes: &[&str] = if mic { &["Audio/Source", "Audio/Source/Virtual", "Audio/Duplex"] } else { &["Audio/Sink", "Audio/Duplex"] };
+    pw::nodes().into_iter()
+        .filter(|n| classes.contains(&n.class.as_str()) && !n.name.is_empty())
+        .map(|n| Device { name: if n.desc.is_empty() { n.name.clone() } else { n.desc }, id: n.name })
+        .collect()
 }
 
-/// Exe names of apps that have audio sessions on any output, or a visible window
-/// (so a game can be added before it makes a sound).
-pub fn list_apps(window_pids: Vec<u32>) -> Vec<String> {
-    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    let names: HashMap<u32, String> = processes().into_iter().map(|p| (p.0, p.2)).collect();
-    let session_pids = || -> Result<Vec<u32>> {
-        let mut out = Vec::new();
-        unsafe {
-            let all = enumerator()?.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-            for d in 0..all.GetCount()? {
-                let mgr: IAudioSessionManager2 = all.Item(d)?.Activate(CLSCTX_ALL, None)?;
-                let list = mgr.GetSessionEnumerator()?;
-                let pid = |i| list.GetSession(i)?.cast::<IAudioSessionControl2>()?.GetProcessId();
-                out.extend((0..list.GetCount()?).filter_map(|i| pid(i).ok()));
-            }
-        }
-        Ok(out)
-    };
+/// Executable names of apps that have audio streams open (playing, or paused but open).
+pub fn list_apps() -> Vec<String> {
     let own = std::process::id();
-    let apps: BTreeSet<String> = session_pids().unwrap_or_default().into_iter().chain(window_pids)
-        .filter(|&p| p != 0 && p != own)
-        .filter_map(|p| names.get(&p).cloned())
-        .filter(|n| !n.eq_ignore_ascii_case("explorer.exe"))
+    let apps: BTreeSet<String> = pw::nodes().into_iter()
+        .filter(|n| n.class == "Stream/Output/Audio" && n.pid != own)
+        .map(|n| if n.binary.is_empty() { n.app } else { n.binary })
+        .map(|b| b.rsplit('/').next().unwrap_or_default().to_string())
+        .filter(|b| !b.is_empty())
         .collect();
     apps.into_iter().collect()
 }
@@ -374,7 +228,7 @@ mod tests {
     use super::*;
 
     fn source() -> Source {
-        Source { kind: Kind::Mic(String::new()), mute: 1, dev: None, id: None, written: 0, pend: Vec::new(), next_check: 0, last_data: 0, easing: false }
+        Source::new(Kind::Mic(String::new()), 1)
     }
 
     /// Feeds 10 minutes of packets from a device whose clock runs `ppm` off, with `jitter` samples
