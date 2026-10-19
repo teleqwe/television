@@ -31,7 +31,11 @@ impl Hotkey {
             return Ok(());
         };
         let key = qt_key(new).ok_or("KDE can't use that key")?;
-        let set = |key: Vec<i32>| kga.call::<_, _, Vec<i32>>("setShortcut", &(ACTION.to_vec(), key, 6u32)); // SetPresent | NoAutoloading
+        // On a plain thread: zbus's blocking calls panic when made from an async command, which
+        // runs on the async runtime's threads.
+        let set = |key: Vec<i32>| std::thread::scope(|s| {
+            s.spawn(|| kga.call::<_, _, Vec<i32>>("setShortcut", &(ACTION.to_vec(), key, 6u32))).join().unwrap() // SetPresent | NoAutoloading
+        });
         match set(vec![key]) {
             Ok(got) if got == [key] => Ok(()),
             r => {

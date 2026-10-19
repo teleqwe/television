@@ -13,7 +13,7 @@ use std::time::Duration;
 use std::{fs, path::PathBuf, thread};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::ShortcutState;
 
@@ -149,7 +149,7 @@ fn set_autostart(on: bool) {
     if on {
         let exe = std::env::current_exe().unwrap_or_default();
         let exe = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-        let entry = format!("[Desktop Entry]\nType=Application\nName=Television\nExec=\"{exe}\" --tray\nIcon=television\nX-GNOME-Autostart-enabled=true\n");
+        let entry = format!("[Desktop Entry]\nType=Application\nName=Television\nExec=\"{exe}\" --tray\nIcon={APP_ID}\nX-GNOME-Autostart-enabled=true\n");
         let _ = fs::create_dir_all(file.parent().unwrap());
         let _ = fs::write(file, entry);
     } else {
@@ -321,24 +321,39 @@ fn hotkey_outcome(changed: bool, registered: Result<(), String>) -> Result<bool,
     }
 }
 
-// Async (off the main thread): a buffer restart holds the lock for up to a few seconds, and a
-// sync command waiting on it would freeze the window and tray.
+/// Runs `f` on the async runtime's blocking-thread pool. Commands wait on the App lock there,
+/// never on the main thread (it would freeze the window and tray) or an async worker: a restart
+/// holds the lock for seconds (minutes, with the picker open), and with every worker stuck
+/// waiting, the D-Bus connections that run on them (the portal's, the single-instance one) stop,
+/// so the restart never finishes and Quit hangs.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tauri::async_runtime::spawn_blocking(f).await.expect("command panicked")
+}
+
 #[tauri::command]
-async fn get_status(state: State<'_, Mutex<App>>) -> Result<Status, String> {
-    Ok(status(&state.lock().unwrap()))
+async fn get_status(app: AppHandle) -> Result<Status, String> {
+    Ok(blocking(move || status(&app.state::<Mutex<App>>().lock().unwrap())).await)
 }
 
 /// Forgets the picked screen/window and opens the portal's picker again.
 #[tauri::command]
-async fn pick_source(state: State<'_, Mutex<App>>) -> Result<Status, String> {
-    let mut a = state.lock().unwrap();
-    a.settings.restore_token.clear();
-    a.restart();
-    Ok(status(&a))
+async fn pick_source(app: AppHandle) -> Result<Status, String> {
+    blocking(move || {
+        let state = app.state::<Mutex<App>>();
+        let mut a = state.lock().unwrap();
+        a.settings.restore_token.clear();
+        a.restart();
+        Ok(status(&a))
+    }).await
 }
 
 #[tauri::command]
-async fn update_settings(app: AppHandle, state: State<'_, Mutex<App>>, hotkeys: State<'_, hotkey::Hotkey>, mut settings: Settings) -> Result<Status, String> {
+async fn update_settings(app: AppHandle, settings: Settings) -> Result<Status, String> {
+    blocking(move || apply_settings(&app, settings)).await
+}
+
+fn apply_settings(app: &AppHandle, mut settings: Settings) -> Result<Status, String> {
+    let (state, hotkeys) = (app.state::<Mutex<App>>(), app.state::<hotkey::Hotkey>());
     // One update at a time: the UI can send a second before the first returns.
     static ONE: Mutex<()> = Mutex::new(());
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
@@ -349,7 +364,7 @@ async fn update_settings(app: AppHandle, state: State<'_, Mutex<App>>, hotkeys: 
     let changed = settings.hotkey != old_hotkey;
     let mut registered = false;
     if changed || failed {
-        registered = hotkey_outcome(changed, hotkeys.set(&app, &settings.hotkey, changed.then_some(old_hotkey.as_str())))?;
+        registered = hotkey_outcome(changed, hotkeys.set(app, &settings.hotkey, changed.then_some(old_hotkey.as_str())))?;
     }
     let mut a = state.lock().unwrap();
     if registered {
@@ -391,12 +406,15 @@ fn list_audio_apps() -> Vec<String> {
 /// The newest preview frame (see `video::Preview`), and asks for the next one. Empty until the
 /// first request has been served.
 #[tauri::command]
-async fn get_preview(state: State<'_, Mutex<App>>) -> Result<tauri::ipc::Response, String> {
-    let a = state.lock().unwrap();
-    let frame = a.session.as_ref().map(|s| {
-        s.preview.want.store(true, Ordering::Relaxed);
-        s.preview.frame.lock().unwrap().clone()
-    });
+async fn get_preview(app: AppHandle) -> Result<tauri::ipc::Response, String> {
+    let frame = blocking(move || {
+        let state = app.state::<Mutex<App>>();
+        let a = state.lock().unwrap();
+        a.session.as_ref().map(|s| {
+            s.preview.want.store(true, Ordering::Relaxed);
+            s.preview.frame.lock().unwrap().clone()
+        })
+    }).await;
     Ok(tauri::ipc::Response::new(frame.unwrap_or_default()))
 }
 
@@ -406,15 +424,39 @@ fn save_clip_now(app: AppHandle) {
 }
 
 #[tauri::command]
-fn open_folder(state: State<Mutex<App>>) {
-    let folder = state.lock().unwrap().settings.folder.clone();
-    let _ = fs::create_dir_all(&folder);
-    let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+async fn open_folder(app: AppHandle) {
+    blocking(move || {
+        let folder = app.state::<Mutex<App>>().lock().unwrap().settings.folder.clone();
+        let _ = fs::create_dir_all(&folder);
+        let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+    }).await
 }
 
 #[tauri::command]
 async fn pick_folder(app: AppHandle) -> Option<String> {
-    app.dialog().file().blocking_pick_folder().map(|p| p.to_string())
+    blocking(move || app.dialog().file().blocking_pick_folder().map(|p| p.to_string())).await
+}
+
+/// Quits for real: stops the capture first, so the portal session (KDE's "Screen casting"
+/// indicator) and PipeWire streams close cleanly, then exits. If the lock or the event loop is
+/// stuck, the process ends anyway; the system closes what it had open.
+fn quit(app: &AppHandle) {
+    let app = app.clone();
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(5));
+        std::process::exit(0);
+    });
+    thread::spawn(move || {
+        let state = app.state::<Mutex<App>>();
+        for _ in 0..40 {
+            if let Ok(mut a) = state.try_lock() {
+                a.session = None;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        app.exit(0);
+    });
 }
 
 #[cfg(test)]
@@ -449,7 +491,48 @@ mod tests {
     }
 }
 
+/// Makes this the only running Television. The single-instance plugin normally sends a second
+/// launch to the running one's window and exits it before this; if it didn't (the old instance
+/// stopped answering), the old one is stopped here instead of a second one recording alongside
+/// it. A lock file held for the process's lifetime tells.
+fn take_over_instance() {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsRawFd;
+    let path = recorder::temp_root().with_file_name("instance.lock");
+    let _ = fs::create_dir_all(path.parent().unwrap());
+    let Ok(mut f) = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) else { return };
+    let lock = |f: &fs::File| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !lock(&f) {
+        let mut pid = String::new();
+        let _ = f.read_to_string(&mut pid);
+        if let Ok(pid) = pid.trim().parse::<i32>() && pid > 0 {
+            eprintln!("stopping unresponsive instance {pid}");
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            for i in 0..50 {
+                thread::sleep(Duration::from_millis(100));
+                if lock(&f) { break }
+                if i == 30 { unsafe { libc::kill(pid, libc::SIGKILL) }; }
+            }
+        }
+        if !lock(&f) {
+            return; // can't tell who holds it; carry on rather than not start at all
+        }
+    }
+    let _ = f.set_len(0).and_then(|_| f.rewind()).and_then(|_| write!(f, "{}", std::process::id()));
+    std::mem::forget(f); // the lock lasts until the process ends
+}
+
+/// Matches tauri.conf.json's identifier and the installed .desktop file, so the desktop can
+/// show Television's name and icon (taskbar, screen-casting indicator).
+pub const APP_ID: &str = "com.teleqwe.television";
+
 fn main() {
+    // GTK's program name becomes the window's Wayland app id.
+    unsafe extern "C" {
+        fn g_set_prgname(name: *const std::ffi::c_char);
+    }
+    let id = std::ffi::CString::new(APP_ID).unwrap();
+    unsafe { g_set_prgname(id.as_ptr()) };
     // WebKitGTK's DMA-BUF renderer shows a blank or flickering window with some NVIDIA drivers;
     // a settings window doesn't need it.
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
@@ -483,8 +566,9 @@ fn main() {
             get_status, pick_source, list_audio_devices, list_audio_apps, update_settings, get_preview, save_clip_now, open_folder, pick_folder
         ])
         .setup(move |app| {
-            // Only the first instance gets here (single-instance runs first), so this can't
-            // delete a running instance's buffer: it's leftovers from a crash.
+            take_over_instance();
+            // Only one instance gets here (see take_over_instance), so this can't delete a
+            // running instance's buffer: it's leftovers from a crash.
             let _ = fs::remove_dir_all(recorder::temp_root());
             let h = app.handle();
             let mut settings: Settings = fs::read_to_string(config_path(h)).ok()
@@ -534,7 +618,7 @@ fn main() {
                 .on_menu_event(|app, e| match e.id.as_ref() {
                     "save" => save_clip(app),
                     "open" => show_window(app),
-                    "quit" => app.exit(0),
+                    "quit" => quit(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, e| {

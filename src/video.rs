@@ -44,6 +44,15 @@ fn pick(cursor: bool, token: &str) -> Result<Picked, String> {
             ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled) => CANCELLED.to_string(),
             e => format!("Screen capture portal: {e}"),
         };
+        // Tells the portal which app is asking (else KDE's "Screen casting" indicator has no name
+        // or icon). Only allowed once per connection, before any other portal call.
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        if !REGISTERED.is_completed() {
+            if let Ok(id) = crate::APP_ID.parse() {
+                let _ = ashpd::register_host_app(id).await.inspect_err(|e| eprintln!("portal registry: {e}"));
+            }
+            REGISTERED.call_once(|| {});
+        }
         let proxy = Screencast::new().await.map_err(e)?;
         let session = proxy.create_session().await.map_err(e)?;
         let cursor = if cursor { CursorMode::Embedded } else { CursorMode::Hidden };
