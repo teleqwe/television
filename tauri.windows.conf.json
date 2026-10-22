@@ -1,0 +1,19 @@
+{
+  "bundle": {
+    "targets": [
+      "nsis"
+    ],
+    "resources": {
+      "third_party/ffmpeg/bin/avcodec-62.dll": "./",
+      "third_party/ffmpeg/bin/avformat-62.dll": "./",
+      "third_party/ffmpeg/bin/avutil-60.dll": "./",
+      "third_party/ffmpeg/bin/swresample-6.dll": "./",
+      "third_party/ffmpeg/LICENSE.txt": "FFmpeg-LICENSE.txt"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "installer.nsh"
+      }
+    }
+  }
+}

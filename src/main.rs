@@ -1,9 +1,14 @@
-mod audio;
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod ff;
 mod hotkey;
-mod pw;
+#[cfg_attr(windows, path = "windows/mod.rs")]
+#[cfg_attr(target_os = "linux", path = "linux/mod.rs")]
+mod platform;
 mod recorder;
-mod video;
+
+#[cfg(target_os = "linux")]
+use platform::pw;
+use platform::{audio, video};
 
 use recorder::Session;
 use serde::{Deserialize, Serialize};
@@ -27,7 +32,8 @@ pub struct AppTrack {
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Settings {
-    pub restore_token: String, // the desktop portal's token for the picked screen/window ("" = ask)
+    pub source: String, // Windows: "auto", "monitor:<device name>" or "window:<hwnd>:<exe>"
+    pub restore_token: String, // Linux: the desktop portal's token for the picked screen/window ("" = ask)
     pub output_height: u32, // 0 = same as source
     pub cursor: bool,
     pub fps: u32,
@@ -47,7 +53,7 @@ pub struct Settings {
     pub mic: bool,
     pub desktop_muted: bool,
     pub mic_muted: bool,
-    pub desktop_device: String, // PipeWire node name, "" = system default
+    pub desktop_device: String, // device id (Windows) or PipeWire node name (Linux), "" = system default
     pub mic_device: String,
     pub apps: Vec<AppTrack>,
     pub audio_bitrate: u32, // kbps
@@ -62,6 +68,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            source: "auto".into(),
             restore_token: String::new(),
             output_height: 0,
             cursor: true,
@@ -126,8 +133,8 @@ impl Settings {
         self.bframes = self.bframes.min(4);
         self.audio_bitrate = self.audio_bitrate.clamp(64, 320);
         self.clip_seconds = self.clip_seconds.clamp(5, 1800);
-        // Strings that reach PipeWire/FFmpeg as C strings can't hold NULs.
-        for s in [&mut self.restore_token, &mut self.desktop_device, &mut self.mic_device, &mut self.hotkey, &mut self.folder] {
+        // Strings that reach the OS/FFmpeg as C strings can't hold NULs.
+        for s in [&mut self.source, &mut self.restore_token, &mut self.desktop_device, &mut self.mic_device, &mut self.hotkey, &mut self.folder] {
             s.retain(|c| c != '\0');
         }
         self.apps.iter_mut().for_each(|a| a.exe.retain(|c| c != '\0'));
@@ -135,34 +142,6 @@ impl Settings {
 
     fn mutes(&self) -> impl Iterator<Item = bool> + '_ {
         [self.desktop_muted, self.mic_muted].into_iter().chain(self.apps.iter().map(|a| a.muted))
-    }
-}
-
-/// Adds or removes Television from the programs started at login (starts in the tray).
-fn set_autostart(on: bool) {
-    let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-    else {
-        return;
-    };
-    let file = dir.join("autostart").join("television.desktop");
-    if on {
-        let exe = std::env::current_exe().unwrap_or_default();
-        let exe = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-        let entry = format!("[Desktop Entry]\nType=Application\nName=Television\nExec=\"{exe}\" --tray\nIcon={APP_ID}\nX-GNOME-Autostart-enabled=true\n");
-        let _ = fs::create_dir_all(file.parent().unwrap());
-        let _ = fs::write(file, entry);
-    } else {
-        let _ = fs::remove_file(file);
-    }
-}
-
-/// Plays a freedesktop theme sound (feedback for a save from the hotkey, which may be in a game).
-fn play_sound(name: &str) {
-    use std::process::{Command, Stdio};
-    let quiet = |c: &mut Command| { c.stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(|mut p| thread::spawn(move || p.wait())) };
-    if quiet(Command::new("canberra-gtk-play").args(["-i", name])).is_err() {
-        let _ = quiet(Command::new("pw-play").arg(format!("/usr/share/sounds/freedesktop/stereo/{name}.oga")));
     }
 }
 
@@ -231,16 +210,30 @@ fn config_path(app: &AppHandle) -> PathBuf {
     app.path().app_config_dir().expect("config dir").join("settings.json")
 }
 
+/// 0.1.1 and earlier (Windows) used the app id com.television.app (Windows Search showed no icon
+/// for it), so their settings live in that folder: carried over once.
+// shortcut: drop this once nobody updates from 0.1.1 anymore.
+fn migrate_config(app: &AppHandle) {
+    let dir = app.path().app_config_dir().expect("config dir");
+    copy_config(&dir.with_file_name("com.television.app"), &dir);
+}
+
+fn copy_config(old: &std::path::Path, dir: &std::path::Path) {
+    if dir.exists() || !old.exists() {
+        return;
+    }
+    let _ = fs::create_dir_all(dir);
+    for f in ["settings.json", "window-height"] {
+        let _ = fs::copy(old.join(f), dir.join(f));
+    }
+}
+
 /// A new, unused clip path. The empty file reserves the name, so two saves in the same second
 /// get "… (2)" instead of writing into one file.
 fn clip_path(s: &Settings) -> Result<String, String> {
     fs::create_dir_all(&s.folder).map_err(|e| format!("Can't create {}: {e}", s.folder))?;
-    let t = unsafe {
-        let (now, mut t) = (libc::time(std::ptr::null_mut()), std::mem::zeroed::<libc::tm>());
-        libc::localtime_r(&now, &mut t);
-        t
-    };
-    let base = format!("Television {:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    let (y, mo, d, h, mi, sec) = platform::local_time();
+    let base = format!("Television {y:04}-{mo:02}-{d:02} {h:02}-{mi:02}-{sec:02}");
     for n in 1.. {
         let name = if n == 1 { format!("{base}.{}", s.container) } else { format!("{base} ({n}).{}", s.container) };
         let path = PathBuf::from(&s.folder).join(name);
@@ -270,7 +263,7 @@ pub fn save_clip(app: &AppHandle) {
             let p = clip_path(&s)?;
             recorder::save(&ring, &streams, &p).map(|_| p)
         });
-        play_sound(if r.is_ok() { "camera-shutter" } else { "dialog-error" });
+        platform::beep(r.is_ok());
         let _ = app.emit("clip", r);
     });
 }
@@ -335,7 +328,12 @@ async fn get_status(app: AppHandle) -> Result<Status, String> {
     Ok(blocking(move || status(&app.state::<Mutex<App>>().lock().unwrap())).await)
 }
 
-/// Forgets the picked screen/window and opens the portal's picker again.
+#[tauri::command]
+fn list_sources() -> Vec<video::Source> {
+    video::list_sources()
+}
+
+/// Forgets the picked screen/window and opens the portal's picker again (Linux).
 #[tauri::command]
 async fn pick_source(app: AppHandle) -> Result<Status, String> {
     blocking(move || {
@@ -380,7 +378,7 @@ fn apply_settings(app: &AppHandle, mut settings: Settings) -> Result<Status, Str
     a.settings = settings;
     a.save();
     if a.settings.autostart != autostart_was {
-        set_autostart(a.settings.autostart);
+        platform::set_autostart(a.settings.autostart);
     }
     if restart {
         a.restart();
@@ -400,6 +398,9 @@ fn list_audio_devices(mic: bool) -> Vec<audio::Device> {
 
 #[tauri::command]
 fn list_audio_apps() -> Vec<String> {
+    #[cfg(windows)]
+    return audio::list_apps(video::window_pids());
+    #[cfg(target_os = "linux")]
     audio::list_apps()
 }
 
@@ -428,7 +429,7 @@ async fn open_folder(app: AppHandle) {
     blocking(move || {
         let folder = app.state::<Mutex<App>>().lock().unwrap().settings.folder.clone();
         let _ = fs::create_dir_all(&folder);
-        let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+        let _ = std::process::Command::new(platform::FILE_MANAGER).arg(folder).spawn();
     }).await
 }
 
@@ -437,8 +438,8 @@ async fn pick_folder(app: AppHandle) -> Option<String> {
     blocking(move || app.dialog().file().blocking_pick_folder().map(|p| p.to_string())).await
 }
 
-/// Quits for real: stops the capture first, so the portal session (KDE's "Screen casting"
-/// indicator) and PipeWire streams close cleanly, then exits. If the lock or the event loop is
+/// Quits for real: stops the capture first, so it closes cleanly (on Linux the portal session
+/// behind KDE's "Screen casting" indicator, and PipeWire streams), then exits. If the lock or the event loop is
 /// stuck, the process ends anyway; the system closes what it had open.
 fn quit(app: &AppHandle) {
     let app = app.clone();
@@ -471,6 +472,21 @@ mod tests {
     }
 
     #[test]
+    fn old_config_is_copied_once() {
+        let root = std::env::temp_dir().join(format!("television-migrate-{}", std::process::id()));
+        let (old, new) = (root.join("com.television.app"), root.join("com.teleqwe.television"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("settings.json"), "{\"fps\":144}").unwrap();
+        super::copy_config(&old, &new);
+        assert_eq!(std::fs::read_to_string(new.join("settings.json")).unwrap(), "{\"fps\":144}");
+        assert!(!new.join("window-height").exists()); // missing files are skipped
+        std::fs::write(old.join("settings.json"), "{}").unwrap();
+        super::copy_config(&old, &new); // already migrated: left alone
+        assert_eq!(std::fs::read_to_string(new.join("settings.json")).unwrap(), "{\"fps\":144}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn sanitize_keeps_settings_in_range() {
         let mut s = super::Settings { fps: 0, keyint: 1000, clip_seconds: 0, container: r"mp4\..\x".into(), codec: "x".into(), ..Default::default() };
         s.sanitize();
@@ -491,53 +507,13 @@ mod tests {
     }
 }
 
-/// Makes this the only running Television. The single-instance plugin normally sends a second
-/// launch to the running one's window and exits it before this; if it didn't (the old instance
-/// stopped answering), the old one is stopped here instead of a second one recording alongside
-/// it. A lock file held for the process's lifetime tells.
-fn take_over_instance() {
-    use std::io::{Read, Seek, Write};
-    use std::os::fd::AsRawFd;
-    let path = recorder::temp_root().with_file_name("instance.lock");
-    let _ = fs::create_dir_all(path.parent().unwrap());
-    let Ok(mut f) = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) else { return };
-    let lock = |f: &fs::File| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if !lock(&f) {
-        let mut pid = String::new();
-        let _ = f.read_to_string(&mut pid);
-        if let Ok(pid) = pid.trim().parse::<i32>() && pid > 0 {
-            eprintln!("stopping unresponsive instance {pid}");
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            for i in 0..50 {
-                thread::sleep(Duration::from_millis(100));
-                if lock(&f) { break }
-                if i == 30 { unsafe { libc::kill(pid, libc::SIGKILL) }; }
-            }
-        }
-        if !lock(&f) {
-            return; // can't tell who holds it; carry on rather than not start at all
-        }
-    }
-    let _ = f.set_len(0).and_then(|_| f.rewind()).and_then(|_| write!(f, "{}", std::process::id()));
-    std::mem::forget(f); // the lock lasts until the process ends
-}
-
 /// Matches tauri.conf.json's identifier and the installed .desktop file, so the desktop can
 /// show Television's name and icon (taskbar, screen-casting indicator).
 pub const APP_ID: &str = "com.teleqwe.television";
 
 fn main() {
-    // GTK's program name becomes the window's Wayland app id.
-    unsafe extern "C" {
-        fn g_set_prgname(name: *const std::ffi::c_char);
-    }
-    let id = std::ffi::CString::new(APP_ID).unwrap();
-    unsafe { g_set_prgname(id.as_ptr()) };
-    // WebKitGTK's DMA-BUF renderer shows a blank or flickering window with some NVIDIA drivers;
-    // a settings window doesn't need it.
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
-    }
+    #[cfg(target_os = "linux")]
+    platform::init();
     // `television --smoke out.mp4 [settings json]`: buffer ~6 s headless, save, exit.
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--smoke") {
@@ -563,21 +539,24 @@ fn main() {
             .with_handler(|app, _, e| if e.state() == ShortcutState::Pressed { save_clip(app) })
             .build())
         .invoke_handler(tauri::generate_handler![
-            get_status, pick_source, list_audio_devices, list_audio_apps, update_settings, get_preview, save_clip_now, open_folder, pick_folder
+            get_status, list_sources, pick_source, list_audio_devices, list_audio_apps, update_settings, get_preview, save_clip_now, open_folder, pick_folder
         ])
         .setup(move |app| {
-            take_over_instance();
-            // Only one instance gets here (see take_over_instance), so this can't delete a
-            // running instance's buffer: it's leftovers from a crash.
+            // A second instance never gets here (the single-instance plugin, and on Linux
+            // take_over_instance), so this can't delete a running instance's buffer: it's
+            // leftovers from a crash.
+            #[cfg(target_os = "linux")]
+            platform::take_over_instance();
             let _ = fs::remove_dir_all(recorder::temp_root());
             let h = app.handle();
+            migrate_config(h);
             let mut settings: Settings = fs::read_to_string(config_path(h)).ok()
                 .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             settings.sanitize();
             if settings.folder.is_empty() {
                 settings.folder = app.path().video_dir()?.join("Television").to_string_lossy().into_owned();
             }
-            set_autostart(settings.autostart); // matches the setting, and keeps the path current if the exe moved
+            platform::set_autostart(settings.autostart); // matches the setting, and keeps the path current if the exe moved
             let hotkeys = hotkey::Hotkey::new(h);
             let hotkey_error = hotkeys.set(h, &settings.hotkey, None).err()
                 .map(|e| format!("Can't use hotkey {}: {e}. Pick another under Clips.", settings.hotkey));
@@ -597,7 +576,10 @@ fn main() {
                     let mut a = state.lock().unwrap();
                     let died = a.session.as_ref().is_some_and(|s| !s.alive() || s.ring.lock().unwrap().error.is_some());
                     // Not after the picker was dismissed: that would just open it again.
+                    #[cfg(target_os = "linux")]
                     let waiting = a.error.as_deref() == Some(video::CANCELLED);
+                    #[cfg(windows)]
+                    let waiting = false;
                     if died || (a.session.is_none() && tick % 6 == 0 && !waiting) {
                         a.restart();
                     }

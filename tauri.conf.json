@@ -15,11 +15,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "rpm"],
-    "icon": ["icons/icon.png"],
-    "linux": {
-      "deb": { "depends": ["libpipewire-0.3-0", "ffmpeg", "xdg-desktop-portal", "libegl1", "libopengl0"] },
-      "rpm": { "depends": ["pipewire-libs", "ffmpeg-libs", "xdg-desktop-portal", "libglvnd-egl", "libglvnd-opengl"] }
-    }
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
   }
 }

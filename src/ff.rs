@@ -1,6 +1,7 @@
-// Safe wrappers over src/shim.c.
+// Safe wrappers over src/<platform>/shim.c.
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use crate::pw::{HwFrame, HwFrames};
 
 #[repr(C)]
@@ -14,11 +15,21 @@ pub struct RawPkt {
     pub size: i32,
 }
 
+#[cfg(windows)]
+unsafe extern "C" {
+    fn vid_open(dev: *mut c_void, w: i32, h: i32, fps: i32, codec: *const c_char, opts: *const c_char, err: *mut c_char) -> *mut c_void;
+    fn vid_encode(e: *mut c_void, tex: *mut c_void, w: i32, h: i32, pts: i64) -> i32;
+}
+
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn vid_open(w: i32, h: i32, fps: i32, fmt: i32, codec: *const c_char, opts: *const c_char, err: *mut c_char) -> *mut c_void;
     fn vid_open_hw(frames: *mut c_void, fps: i32, codec: *const c_char, opts: *const c_char, err: *mut c_char) -> *mut c_void;
     fn vid_encode_hw(e: *mut c_void, frame: *mut c_void, pts: i64) -> i32;
     fn vid_encode(e: *mut c_void, data: *const u8, stride: i32, w: i32, h: i32, fmt: i32, pts: i64) -> i32;
+}
+
+unsafe extern "C" {
     fn aud_open(bitrate: i32, err: *mut c_char) -> *mut c_void;
     fn aud_encode(e: *mut c_void, data: *const f32, n: i32) -> i32;
     fn aud_skip(e: *mut c_void, n: i64);
@@ -50,35 +61,9 @@ pub struct Encoder(*mut c_void);
 unsafe impl Send for Encoder {}
 
 impl Encoder {
-    /// Frames will be `fmt` (an AVPixelFormat, packed 32-bit RGB). `opts` is "key=value:key=value"
-    /// of FFmpeg encoder options.
-    pub fn video(w: u32, h: u32, fps: u32, fmt: i32, codec: &str, opts: &str) -> Result<Self, String> {
-        let (codec, opts) = (CString::new(codec).unwrap(), CString::new(opts).unwrap());
-        let mut err = [0; 256];
-        opened(unsafe { vid_open(w as i32, h as i32, fps as i32, fmt, codec.as_ptr(), opts.as_ptr(), err.as_mut_ptr()) }, &err)
-    }
-
-    /// Frames will be CUDA frames from `frames` (see pw::Video::gpu_output), at its size.
-    pub fn video_hw(frames: &HwFrames, fps: u32, codec: &str, opts: &str) -> Result<Self, String> {
-        let (codec, opts) = (CString::new(codec).unwrap(), CString::new(opts).unwrap());
-        let mut err = [0; 256];
-        opened(unsafe { vid_open_hw(frames.0, fps as i32, codec.as_ptr(), opts.as_ptr(), err.as_mut_ptr()) }, &err)
-    }
-
     pub fn audio(bitrate: u32) -> Result<Self, String> {
         let mut err = [0; 256];
         opened(unsafe { aud_open(bitrate as i32, err.as_mut_ptr()) }, &err)
-    }
-
-    /// `data` is a w x h packed 32-bit `fmt` image, `stride` bytes per row; scaled if it isn't
-    /// the encoder's size or format.
-    pub fn encode_video(&mut self, data: &[u8], stride: u32, w: u32, h: u32, fmt: i32, pts: i64) -> Result<(), String> {
-        assert!(data.len() >= stride as usize * (h as usize - 1) + w as usize * 4);
-        check(unsafe { vid_encode(self.0, data.as_ptr(), stride as i32, w as i32, h as i32, fmt, pts) }, "video encode")
-    }
-
-    pub fn encode_hw(&mut self, frame: HwFrame, pts: i64) -> Result<(), String> {
-        check(unsafe { vid_encode_hw(self.0, frame.into_raw(), pts) }, "video encode")
     }
 
     /// Interleaved stereo f32 at 48 kHz; `f` gets each finished packet.
@@ -110,6 +95,50 @@ impl Encoder {
 
     pub fn params(&self) -> Params {
         Params(unsafe { enc_params(self.0) })
+    }
+}
+
+#[cfg(windows)]
+impl Encoder {
+    /// `dev` is an ID3D11Device*. `opts` is "key=value:key=value" of FFmpeg encoder options.
+    pub fn video(dev: *mut c_void, w: u32, h: u32, fps: u32, codec: &str, opts: &str) -> Result<Self, String> {
+        let (codec, opts) = (CString::new(codec).unwrap(), CString::new(opts).unwrap());
+        let mut err = [0; 256];
+        opened(unsafe { vid_open(dev, w as i32, h as i32, fps as i32, codec.as_ptr(), opts.as_ptr(), err.as_mut_ptr()) }, &err)
+    }
+
+    /// `tex` is an ID3D11Texture2D* (BGRA, w x h); scaled on the GPU if it isn't the encoder size.
+    pub fn encode_video(&mut self, tex: *mut c_void, w: u32, h: u32, pts: i64) -> Result<(), String> {
+        check(unsafe { vid_encode(self.0, tex, w as i32, h as i32, pts) }, "video encode")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Encoder {
+    /// Frames will be `fmt` (an AVPixelFormat, packed 32-bit RGB). `opts` is "key=value:key=value"
+    /// of FFmpeg encoder options.
+    pub fn video(w: u32, h: u32, fps: u32, fmt: i32, codec: &str, opts: &str) -> Result<Self, String> {
+        let (codec, opts) = (CString::new(codec).unwrap(), CString::new(opts).unwrap());
+        let mut err = [0; 256];
+        opened(unsafe { vid_open(w as i32, h as i32, fps as i32, fmt, codec.as_ptr(), opts.as_ptr(), err.as_mut_ptr()) }, &err)
+    }
+
+    /// Frames will be CUDA frames from `frames` (see pw::Video::gpu_output), at its size.
+    pub fn video_hw(frames: &HwFrames, fps: u32, codec: &str, opts: &str) -> Result<Self, String> {
+        let (codec, opts) = (CString::new(codec).unwrap(), CString::new(opts).unwrap());
+        let mut err = [0; 256];
+        opened(unsafe { vid_open_hw(frames.0, fps as i32, codec.as_ptr(), opts.as_ptr(), err.as_mut_ptr()) }, &err)
+    }
+
+    /// `data` is a w x h packed 32-bit `fmt` image, `stride` bytes per row; scaled if it isn't
+    /// the encoder's size or format.
+    pub fn encode_video(&mut self, data: &[u8], stride: u32, w: u32, h: u32, fmt: i32, pts: i64) -> Result<(), String> {
+        assert!(data.len() >= stride as usize * (h as usize - 1) + w as usize * 4);
+        check(unsafe { vid_encode(self.0, data.as_ptr(), stride as i32, w as i32, h as i32, fmt, pts) }, "video encode")
+    }
+
+    pub fn encode_hw(&mut self, frame: HwFrame, pts: i64) -> Result<(), String> {
+        check(unsafe { vid_encode_hw(self.0, frame.into_raw(), pts) }, "video encode")
     }
 }
 

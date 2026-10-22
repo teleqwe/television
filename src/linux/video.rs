@@ -12,6 +12,14 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[derive(serde::Serialize)]
+pub struct Source;
+
+/// Wayland doesn't let apps list screens or windows: the portal's picker chooses (see `pick`).
+pub fn list_sources() -> Vec<Source> {
+    Vec::new()
+}
+
 /// The error when the portal's picker was dismissed: nothing to record until the user picks again,
 /// so the watchdog doesn't reopen the picker on its own.
 pub const CANCELLED: &str = "Nothing to record yet. Click Change under Capture to pick a screen or window.";

@@ -23,11 +23,18 @@
   <section>
     <h2>Capture</h2>
     <div class="card">
-      <div class="row" data-tip="What gets recorded: a whole screen, or one window (only that window, so notifications and other windows stay out). You pick it in the system's screen-sharing dialog, once: it's remembered, also across restarts. Change opens the dialog again.">
+      <div class="row" data-os="windows" data-tip="What gets recorded. Automatic records the focused fullscreen game (only the game, so notifications and other windows stay out) and your main display the rest of the time. Pick a display to record everything on it, or a window to record just that window. Exclusive-fullscreen games on a portrait (rotated) monitor aren't supported: they record sideways.">
         <label for="source">Source</label>
-        <div class="ctl"><button id="source" class="field">Change…</button></div>
+        <div class="ctl with-btn">
+          <select id="source" data-k="source"></select>
+          <button id="refresh" class="icon" title="Refresh list"><svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg></button>
+        </div>
       </div>
-      <div class="row" data-tip="Records at a lower resolution than your screen. Smaller files and less memory, at the cost of sharpness. Scaling runs on the CPU (spread over all cores), so leave this on Same as source unless you need smaller clips.">
+      <div class="row" data-os="linux" data-tip="What gets recorded: a whole screen, or one window (only that window, so notifications and other windows stay out). You pick it in the system's screen-sharing dialog, once: it's remembered, also across restarts. Change opens the dialog again.">
+        <label for="pick">Source</label>
+        <div class="ctl"><button id="pick" class="field">Change…</button></div>
+      </div>
+      <div class="row" data-tip="Records at a lower resolution than your screen. Smaller files and less memory, at the cost of sharpness. Scaling runs on the GPU, not the cores your game uses.">
         <label for="output_height">Output resolution</label>
         <div class="ctl"><select id="output_height" data-k="output_height" data-num>
           <option value="0">Same as source</option><option value="2160">2160p</option><option value="1440">1440p</option>
@@ -151,7 +158,7 @@
         <div class="ctl"><select id="mic_device" data-k="mic_device" data-devices="in"></select></div>
       </div>
       <div id="apps"></div>
-      <div class="row" data-tip="Records one app's audio on its own track, e.g. Discord or the game alone, so you can adjust or remove it when editing. The list shows apps that have sound open right now; once added, the track follows the app as it opens and closes its sound. Desktop audio already includes every app, so app tracks are extras for editing.">
+      <div class="row" data-tip="Records one app's audio on its own track, e.g. Discord or the game alone, so you can adjust or remove it when editing. The list shows apps that are playing or have played sound. Desktop audio already includes every app, so app tracks are extras for editing.">
         <label for="app-pick">Add app track</label>
         <div class="ctl with-btn">
           <select id="app-pick"></select>
@@ -181,7 +188,7 @@
           <option value="false">Memory</option><option value="true">Disk</option>
         </select></div>
       </div>
-      <div class="row" data-tip="Saves a clip from anywhere, even in game. Click, then press the key combination; Esc cancels. On KDE it's also listed under System Settings → Shortcuts → Television.">
+      <div class="row" data-tip="Saves a clip from anywhere, even in game. Click, then press the key combination; Esc cancels. On Linux with KDE it's also listed under System Settings → Shortcuts → Television.">
         <label for="hotkey">Save hotkey</label>
         <div class="ctl"><button id="hotkey" class="field">—</button></div>
       </div>

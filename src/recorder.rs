@@ -10,16 +10,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+/// Shared clock for audio and video, in 100 ns units (same units WASAPI reports).
+#[cfg(windows)]
+pub fn now_100ns() -> i64 {
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    let (mut c, mut f) = (0, 0);
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut c);
+        let _ = QueryPerformanceFrequency(&mut f);
+    }
+    (c as i128 * 10_000_000 / f as i128) as i64
+}
+
 /// Shared clock for audio and video, in 100 ns units: CLOCK_MONOTONIC, which PipeWire stamps
 /// audio packets with.
+#[cfg(target_os = "linux")]
 pub fn now_100ns() -> i64 {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
     t.tv_sec * 10_000_000 + t.tv_nsec / 100
 }
 
+/// Where disk buffers live; wiped at startup in case a previous run crashed.
+#[cfg(windows)]
+pub fn temp_root() -> PathBuf {
+    std::env::temp_dir().join("Television")
+}
+
 /// Where disk buffers live; wiped at startup in case a previous run crashed. Under the user's
 /// cache folder, not /tmp: that's often a RAM disk, which would defeat the point.
+#[cfg(target_os = "linux")]
 pub fn temp_root() -> PathBuf {
     let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
