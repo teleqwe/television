@@ -211,6 +211,13 @@ fn run(s: &Settings, t0: i64, stop: &AtomicBool, ring: &Mutex<Ring>, preview: &P
                 // The capture fell back to shared memory: start over (the restart uses it).
                 return Err("The screen stream changed format.".into());
             }
+            // A stream can stall without ending (Hyprland's portal did, after the screens slept),
+            // which would record its last picture forever. Compositors only send a picture when
+            // something changed, so a still screen looks the same: waiting a whole clip length
+            // means the restart (which empties the buffer) drops no video, only that still picture.
+            if !p.window && now_100ns() - f.at > (s.clip_seconds as i64).max(60) * 10_000_000 {
+                return Err("The screen stream stopped sending pictures.".into());
+            }
             if !gpu {
                 last = n;
                 enc.encode_video(&f.data, f.stride, f.w, f.h, f.fmt, n)?;

@@ -35,6 +35,7 @@ pub struct Frame {
     pub h: u32,
     pub fmt: i32,
     pub gpu: bool,
+    pub at: i64, // now_100ns() when it arrived
 }
 
 pub type Latest = Mutex<Option<Frame>>;
@@ -53,7 +54,8 @@ extern "C" fn on_frame(user: *mut c_void, data: *const u8, stride: c_int, w: c_i
         return;
     }
     let mut l = latest.lock().unwrap();
-    let f = l.get_or_insert_with(|| Frame { data: Vec::new(), stride: 0, w: 0, h: 0, fmt, gpu: false });
+    let f = l.get_or_insert_with(|| Frame { data: Vec::new(), stride: 0, w: 0, h: 0, fmt, gpu: false, at: 0 });
+    f.at = crate::recorder::now_100ns();
     if data.is_null() {
         (f.data, f.stride, f.w, f.h, f.fmt, f.gpu) = (Vec::new(), 0, w as u32, h as u32, fmt, true);
         return;
@@ -120,7 +122,7 @@ impl HwFrame {
     pub fn download(&self, w: u32, h: u32) -> Option<Frame> {
         let mut data = vec![0; (w * h * 4) as usize];
         let ok = unsafe { hw_frame_download(self.0, data.as_mut_ptr(), w as c_int, h as c_int) } >= 0;
-        ok.then_some(Frame { data, stride: w * 4, w, h, fmt: AV_PIX_FMT_RGB0, gpu: false })
+        ok.then_some(Frame { data, stride: w * 4, w, h, fmt: AV_PIX_FMT_RGB0, gpu: false, at: 0 })
     }
 }
 

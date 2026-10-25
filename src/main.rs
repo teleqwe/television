@@ -529,11 +529,14 @@ fn main() {
         println!("restore token: {}", sess.token.as_deref().unwrap_or(""));
         return;
     }
-    let tray_only = args.iter().any(|a| a == "--tray");
+    let tray_only = args.iter().any(|a| a == "--tray" || a == "--save");
 
     tauri::Builder::default()
-        // A second launch just opens the running instance's window.
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
+        // A second launch opens the running instance's window, or with --save saves a clip
+        // (for desktops without a global shortcut Television can register, e.g. Hyprland).
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            if args.iter().any(|a| a == "--save") { save_clip(app) } else { show_window(app) }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new()
             .with_handler(|app, _, e| if e.state() == ShortcutState::Pressed { save_clip(app) })

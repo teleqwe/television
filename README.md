@@ -59,7 +59,8 @@ The first start opens the system's screen-sharing dialog: pick a screen (or a wi
 - Windows: exclusive-fullscreen games on a portrait (rotated) monitor record sideways, and in exclusive fullscreen the cursor isn't drawn.
 - Linux: there's no Automatic source, because Wayland doesn't let apps see which window is focused. Pick the screen the game runs on.
 - Linux: frames normally stay on the GPU (DMA-BUF from the compositor, scaled in OpenGL, encoded from CUDA). If the compositor can't share DMA-BUFs with the NVIDIA GPU (e.g. it renders on another GPU), Television falls back to frames in system memory, which costs CPU, more so when downscaling. `TELEVISION_NO_DMABUF=1` forces that fallback.
-- Linux: outside KDE, the hotkey falls back to an X11 key grab, which only fires while an XWayland window is focused.
+- Linux: outside KDE, the hotkey falls back to an X11 key grab, which only fires while an XWayland window is focused. Bind your key to `television --save` in your desktop's shortcut settings instead; it tells the running Television to save. On Hyprland, for example: `bind = ALT, F11, exec, television --save` (or with the Lua config, `hl.bind("ALT + F11", hl.dsp.exec_cmd("television --save"))`).
+- Linux: a screen stream that sends no new picture for a whole clip length (at least 60 s) is restarted, because some portals (Hyprland's, after the screens slept) stall without closing the stream. A screen that really didn't change for that long loses nothing but that still picture.
 
 ## Layout
 
