@@ -146,8 +146,11 @@ impl Settings {
 }
 
 struct App {
+    handle: AppHandle,
     settings: Settings,
     config: PathBuf, // settings.json
+    #[cfg_attr(windows, allow(dead_code))]
+    monitors: usize, // how many the desktop had when the capture last started
     session: Option<Session>,
     error: Option<String>, // why the session couldn't start
     hotkey_error: Option<String>, // buffering works, but the hotkey doesn't
@@ -159,12 +162,18 @@ impl App {
     fn restart(&mut self) {
         self.session = None; // stop the old capture before opening a new one
         let token = std::mem::take(&mut self.settings.restore_token); // tokens are single-use
-        match Session::start(&Settings { restore_token: token, ..self.settings.clone() }) {
+        match Session::start(&Settings { restore_token: token.clone(), ..self.settings.clone() }) {
             Ok(s) => {
                 self.settings.restore_token = s.token.clone().unwrap_or_default();
+                self.monitors = self.handle.available_monitors().map_or(0, |m| m.len());
                 (self.session, self.error) = (Some(s), None);
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => {
+                // The next try needs it (e.g. a screen that comes back): without it the portal
+                // can only ask again.
+                self.settings.restore_token = token;
+                self.error = Some(e);
+            }
         }
         self.save();
     }
@@ -564,7 +573,7 @@ fn main() {
             let hotkey_error = hotkeys.set(h, &settings.hotkey, None).err()
                 .map(|e| format!("Can't use hotkey {}: {e}. Pick another under Clips.", settings.hotkey));
             app.manage(hotkeys);
-            app.manage(Mutex::new(App { settings, config: config_path(h), session: None, error: None, hotkey_error }));
+            app.manage(Mutex::new(App { handle: h.clone(), settings, config: config_path(h), monitors: 0, session: None, error: None, hotkey_error }));
             // Off the main thread: the first start may open the source picker and wait on it.
             let first = h.clone();
             thread::spawn(move || first.state::<Mutex<App>>().lock().unwrap().restart());
@@ -573,11 +582,34 @@ fn main() {
             // crash, disk full, ...) restart it; if it couldn't start, retry every 30 s.
             let watch = h.clone();
             thread::spawn(move || {
+                #[cfg(target_os = "linux")]
+                let mut back = 0; // ticks in a row with the monitors back (see below)
                 for tick in 1u64.. {
                     thread::sleep(Duration::from_secs(5));
                     let state = watch.state::<Mutex<App>>();
                     let mut a = state.lock().unwrap();
-                    let died = a.session.as_ref().is_some_and(|s| !s.alive() || s.ring.lock().unwrap().error.is_some());
+                    let ring_error = a.session.as_ref().and_then(|s| s.ring.lock().unwrap().error.clone());
+                    let died = a.session.as_ref().is_some_and(|s| !s.alive()) || ring_error.is_some();
+                    // The recorded screen went away: monitors asleep (some disconnect entirely) or
+                    // unplugged. Asking the portal before it's back only gets its picker, which
+                    // Hyprland put off-screen where nobody could answer it. So wait until there are
+                    // as many monitors as when the capture started, twice in a row so they've
+                    // settled, then restore it with the token.
+                    #[cfg(target_os = "linux")]
+                    {
+                        if ring_error.as_deref() == Some(video::GONE) {
+                            (a.session, a.error, back) = (None, Some(video::GONE_WAITING.into()), 0);
+                            continue;
+                        }
+                        if a.error.as_deref() == Some(video::GONE_WAITING) {
+                            let n = watch.available_monitors().map_or(0, |m| m.len());
+                            back = if n >= a.monitors { back + 1 } else { 0 };
+                            if back >= 2 {
+                                a.restart();
+                            }
+                            continue;
+                        }
+                    }
                     // Not after the picker was dismissed: that would just open it again.
                     #[cfg(target_os = "linux")]
                     let waiting = a.error.as_deref() == Some(video::CANCELLED);

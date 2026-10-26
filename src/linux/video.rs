@@ -24,6 +24,11 @@ pub fn list_sources() -> Vec<Source> {
 /// so the watchdog doesn't reopen the picker on its own.
 pub const CANCELLED: &str = "Nothing to record yet. Click Change under Capture to pick a screen or window.";
 
+/// The error when the recorded screen went away, and the status while waiting for it (main.rs's
+/// watchdog restarts the capture once it's back).
+pub const GONE: &str = "The recorded screen went away.";
+pub const GONE_WAITING: &str = "The recorded screen went away (asleep or unplugged). Recording starts again when it's back, or click Change under Capture to pick another.";
+
 /// What the portal handed us: keep it alive for as long as the stream runs.
 struct Portal {
     _proxy: Screencast<'static>,
@@ -65,15 +70,39 @@ fn pick(cursor: bool, token: &str) -> Result<Picked, String> {
         let session = proxy.create_session().await.map_err(e)?;
         let cursor = if cursor { CursorMode::Embedded } else { CursorMode::Hidden };
         let token = (!token.is_empty()).then_some(token);
-        proxy.select_sources(&session, cursor, SourceType::Monitor | SourceType::Window, false, token, PersistMode::ExplicitlyRevoked)
-            .await.map_err(e)?;
-        let started = proxy.start(&session, None).await.map_err(e)?.response().map_err(e)?;
+        // The picker may show in either call (Hyprland's shows it in SelectSources). One nobody
+        // answers is given up on rather than left open, maybe off-screen: closing the session
+        // withdraws the request. Hyprland's portal waits on its picker process and only hears the
+        // close once that's gone, so pickers that appeared during this request are ended too.
+        let pickers_before = hyprland_pickers();
+        let ask = async {
+            proxy.select_sources(&session, cursor, SourceType::Monitor | SourceType::Window, false, token, PersistMode::ExplicitlyRevoked)
+                .await.map_err(e)?;
+            proxy.start(&session, None).await.map_err(e)?.response().map_err(e)
+        };
+        let Ok(started) = tokio::time::timeout(Duration::from_secs(90), ask).await else {
+            for pid in hyprland_pickers().into_iter().filter(|p| !pickers_before.contains(p)) {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(2), session.close()).await;
+            return Err(CANCELLED.into());
+        };
+        let started = started?;
         let stream = started.streams().first().ok_or("The portal returned no stream.")?;
         let (node, window) = (stream.pipe_wire_node_id(), stream.source_type() == Some(SourceType::Window));
         let token = started.restore_token().map(str::to_string);
         let fd = proxy.open_pipe_wire_remote(&session).await.map_err(e)?;
         Ok(Picked { portal: Portal { _proxy: proxy, session }, fd, node, window, token })
     })
+}
+
+/// Process ids of running hyprland-share-picker windows (xdg-desktop-portal-hyprland's picker).
+fn hyprland_pickers() -> Vec<i32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "hyprland-share-")) // comm is cut to 15 chars
+        .collect()
 }
 
 /// FFmpeg NVENC options from settings.
@@ -199,7 +228,7 @@ fn run(s: &Settings, t0: i64, stop: &AtomicBool, ring: &Mutex<Ring>, preview: &P
             // (restarting would just open the picker). A screen that went away (turned off,
             // unplugged) is restarted by the watchdog, which brings it back once it's there.
             if !p.window {
-                return Err("The recorded screen went away.".into());
+                return Err(GONE.into());
             }
             ring.lock().unwrap().warning = Some("The recorded window was closed. Click Change under Capture to pick another.".into());
         }
